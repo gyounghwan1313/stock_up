@@ -3,15 +3,18 @@ from unittest.mock import patch
 
 import pytest
 import responses
-from slack_sender import SlackSender
+
+from sender import SlackSender
 
 
 class TestSlackSender:
+    @patch.dict("os.environ", {}, clear=True)
     def test_init_with_webhook_url(self):
         sender = SlackSender(webhook_url="https://hooks.slack.com/test")
         assert sender.webhook_url == "https://hooks.slack.com/test"
         assert sender.bot_token is None
 
+    @patch.dict("os.environ", {}, clear=True)
     def test_init_with_bot_token(self):
         sender = SlackSender(bot_token="xoxb-test-token")
         assert sender.bot_token == "xoxb-test-token"
@@ -78,6 +81,7 @@ class TestSlackSender:
 
         assert result is False
 
+    @patch.dict("os.environ", {}, clear=True)
     def test_send_webhook_message_without_webhook_url(self):
         sender = SlackSender(bot_token="xoxb-test")
 
@@ -118,6 +122,7 @@ class TestSlackSender:
         request_body = json.loads(responses.calls[0].request.body)
         assert request_body["thread_ts"] == "1234567890.123456"
 
+    @patch.dict("os.environ", {}, clear=True)
     def test_send_bot_message_without_token(self):
         sender = SlackSender(webhook_url="https://test.webhook")
 
@@ -143,6 +148,7 @@ class TestSlackSender:
         assert attachment["fields"][0]["title"] == "AAPL"
         assert attachment["fields"][0]["value"] == "$150.25 (+1.69%)"
 
+    @patch.dict("os.environ", {}, clear=True)
     def test_send_formatted_message_without_webhook(self):
         sender = SlackSender(bot_token="xoxb-test")
 
