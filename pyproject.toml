@@ -1,5 +1,5 @@
 [project]
-name = "sender"
+name = "stock_up"
 version = "0.1.0"
 description = "Slack message sender for stock_up application"
 readme = "README.md"
