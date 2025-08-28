@@ -1,3 +1,5 @@
+"""Slack message sender module for webhook and bot API interactions."""
+
 import os
 from typing import Any, Dict, Optional
 
@@ -8,6 +10,7 @@ load_dotenv()
 
 
 class SlackSender:
+    """Slack message sender supporting both webhooks and bot API."""
     def __init__(
         self, webhook_url: Optional[str] = None, bot_token: Optional[str] = None
     ):
@@ -24,6 +27,7 @@ class SlackSender:
         username: Optional[str] = None,
         icon_emoji: Optional[str] = None,
     ) -> bool:
+        """Send message via Slack webhook."""
         if not self.webhook_url:
             raise ValueError("Webhook URL not configured")
 
@@ -56,6 +60,7 @@ class SlackSender:
         thread_ts: Optional[str] = None,
         blocks: Optional[list] = None,
     ) -> Dict[str, Any]:
+        """Send message via Slack bot API."""
         if not self.bot_token:
             raise ValueError("Bot token not configured")
 
@@ -87,6 +92,7 @@ class SlackSender:
         color: str = "good",
         channel: Optional[str] = None,
     ) -> bool:
+        """Send formatted message with attachments via webhook."""
         if not self.webhook_url:
             raise ValueError("Formatted messages require webhook URL")
 

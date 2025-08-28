@@ -1,3 +1,5 @@
+"""Test module for SlackSender functionality."""
+
 import json
 from unittest.mock import patch
 
@@ -8,20 +10,24 @@ from sender import SlackSender
 
 
 class TestSlackSender:
+    """Test class for SlackSender methods."""
     @patch.dict("os.environ", {}, clear=True)
     def test_init_with_webhook_url(self):
+        """Test SlackSender initialization with webhook URL."""
         sender = SlackSender(webhook_url="https://hooks.slack.com/test")
         assert sender.webhook_url == "https://hooks.slack.com/test"
         assert sender.bot_token is None
 
     @patch.dict("os.environ", {}, clear=True)
     def test_init_with_bot_token(self):
+        """Test SlackSender initialization with bot token."""
         sender = SlackSender(bot_token="xoxb-test-token")
         assert sender.bot_token == "xoxb-test-token"
         assert sender.webhook_url is None
 
     @patch.dict("os.environ", {"SLACK_WEBHOOK_URL": "https://env.webhook.url"})
     def test_init_with_env_webhook(self):
+        """Test SlackSender initialization with environment webhook URL."""
         sender = SlackSender()
         assert sender.webhook_url == "https://env.webhook.url"
 

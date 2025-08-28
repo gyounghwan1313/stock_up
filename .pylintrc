@@ -1,0 +1,10 @@
+[MASTER]
+ignore-paths=tests/
+
+[MESSAGES CONTROL]
+disable=missing-function-docstring,
+        missing-class-docstring,
+        missing-module-docstring
+
+[DESIGN]
+max-line-length=88
