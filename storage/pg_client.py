@@ -7,6 +7,7 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
+from sender.translator import CATEGORIES
 from storage.models import NewsRecord
 
 load_dotenv()
@@ -36,6 +37,22 @@ CREATE INDEX IF NOT EXISTS idx_news_fts ON news
     USING GIN (to_tsvector('simple', title_original || ' ' || title_translated));
 """
 
+CATEGORIES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS categories (
+    id   SERIAL PRIMARY KEY,
+    name VARCHAR UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_categories (
+    news_id      INTEGER REFERENCES news(id),
+    category_id  INTEGER REFERENCES categories(id),
+    PRIMARY KEY (news_id, category_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_categories_news ON news_categories (news_id);
+CREATE INDEX IF NOT EXISTS idx_news_categories_cat ON news_categories (category_id);
+"""
+
 
 class PgNewsStore:
     def __init__(self, dsn: Optional[str] = None):
@@ -52,6 +69,12 @@ class PgNewsStore:
     def init_schema(self) -> None:
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
+            cur.execute(CATEGORIES_SCHEMA_SQL)
+            for name in CATEGORIES:
+                cur.execute(
+                    "INSERT INTO categories (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                    (name,),
+                )
         logger.info("Database schema initialized")
 
     def save_news(self, record: NewsRecord) -> Optional[int]:
@@ -79,7 +102,11 @@ class PgNewsStore:
                 title_hash,
             ))
             row = cur.fetchone()
-            return row[0] if row else None
+            news_id = row[0] if row else None
+
+        if news_id and record.categories:
+            self._save_news_categories(news_id, record.categories)
+        return news_id
 
     def save_news_batch(self, records: list[NewsRecord]) -> int:
         saved = 0
@@ -169,12 +196,62 @@ class PgNewsStore:
         with self.conn.cursor() as cur:
             cur.execute(sql, (symbols, news_id))
 
+    def search_by_category(self, category_name: str, days: int = 30, limit: int = 50) -> list[NewsRecord]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        sql = """
+            SELECT DISTINCT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            FROM news n
+            JOIN news_categories nc ON n.id = nc.news_id
+            JOIN categories c ON nc.category_id = c.id
+            WHERE c.name = %s
+              AND n.collected_at >= %s
+            ORDER BY n.published_at DESC
+            LIMIT %s
+        """
+        return self._fetch_records(sql, (category_name, cutoff, limit))
+
+    def get_all_categories(self) -> list[dict]:
+        with self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute("SELECT id, name FROM categories ORDER BY id")
+            return [dict(row) for row in cur.fetchall()]
+
+    def update_categories(self, news_id: int, category_names: list[str]) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM news_categories WHERE news_id = %s", (news_id,))
+        self._save_news_categories(news_id, category_names)
+
+    def _save_news_categories(self, news_id: int, category_names: list[str]) -> None:
+        with self.conn.cursor() as cur:
+            for name in category_names:
+                cur.execute("SELECT id FROM categories WHERE name = %s", (name,))
+                cat = cur.fetchone()
+                if cat:
+                    cur.execute(
+                        "INSERT INTO news_categories (news_id, category_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                        (news_id, cat[0]),
+                    )
+
     def _fetch_records(self, sql: str, params: tuple) -> list[NewsRecord]:
         with self.conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute(sql, params)
-            return [
-                NewsRecord(
-                    id=row["id"],
+            records = []
+            for row in cur.fetchall():
+                news_id = row["id"]
+                # 카테고리 조회
+                cur2 = self.conn.cursor()
+                cur2.execute(
+                    """SELECT c.name FROM categories c
+                       JOIN news_categories nc ON c.id = nc.category_id
+                       WHERE nc.news_id = %s""",
+                    (news_id,),
+                )
+                cat_rows = cur2.fetchall()
+                categories = [r[0] for r in cat_rows] if cat_rows else None
+                cur2.close()
+
+                records.append(NewsRecord(
+                    id=news_id,
                     title_original=row["title_original"],
                     title_translated=row["title_translated"],
                     source=row["source"],
@@ -183,9 +260,9 @@ class PgNewsStore:
                     collected_at=row["collected_at"],
                     sentiment_score=row["sentiment_score"],
                     related_symbols=row["related_symbols"],
-                )
-                for row in cur.fetchall()
-            ]
+                    categories=categories,
+                ))
+            return records
 
     def close(self) -> None:
         if self._conn and not self._conn.closed:

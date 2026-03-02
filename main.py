@@ -114,10 +114,11 @@ def run_news_pipeline(
             new_news_items = [p[0] for p in new_pairs]
             new_titles = [p[1] for p in new_pairs]
 
-            # 3. 신규 건만 번역
+            # 3. 신규 건 번역 + 카테고리 태깅
             translator = GPTTranslator()
-            new_translated = translator.translate_titles(new_titles)
+            new_translated, new_categories = translator.translate_and_categorize_titles(new_titles)
             trans_map = dict(zip(new_titles, new_translated))
+            cat_map = dict(zip(new_titles, new_categories))
 
             # 4. 신규 건만 감성점수 배치 계산
             if sentiment_analyzer:
@@ -135,7 +136,13 @@ def run_news_pipeline(
             if news_channel:
                 try:
                     slack = SlackSender()
-                    msg = "\n".join(f"• {trans_map.get(t, t)}" for t in new_titles)
+                    lines = []
+                    for t in new_titles:
+                        translated = trans_map.get(t, t)
+                        cats = cat_map.get(t, [])
+                        tag = " ".join(f"[{c}]" for c in cats) if cats else ""
+                        lines.append(f"• {tag} {translated}" if tag else f"• {translated}")
+                    msg = "\n".join(lines)
                     slack.send_bot_message(channel=news_channel, message=msg)
                 except Exception as e:
                     logger.error("News channel Slack send failed: %s", e)
@@ -144,7 +151,7 @@ def run_news_pipeline(
             if news_store is not None:
                 _save_news_to_db(
                     news_store, new_news_items, new_titles, new_translated, source, watchlist,
-                    new_scores,
+                    new_scores, new_categories,
                 )
             else:
                 from storage.symbol_extractor import extract_symbols
@@ -174,8 +181,9 @@ def run_news_pipeline(
 def _save_news_to_db(
     news_store, news_items, titles, translated, source, watchlist,
     sentiment_scores: list[float | None] | None = None,
+    categories_list: list[list[str]] | None = None,
 ) -> set[str]:
-    """수집한 뉴스를 DB에 저장. 감성점수도 즉시 포함.
+    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리도 즉시 포함.
 
     Returns:
         관련 종목 심볼 집합
@@ -201,6 +209,7 @@ def _save_news_to_db(
                 pass
 
         score = sentiment_scores[i] if sentiment_scores and i < len(sentiment_scores) else None
+        cats = categories_list[i] if categories_list and i < len(categories_list) else None
 
         records.append(NewsRecord(
             title_original=original,
@@ -211,6 +220,7 @@ def _save_news_to_db(
             collected_at=datetime.now(),
             sentiment_score=score,
             related_symbols=related if related else None,
+            categories=cats,
         ))
 
     news_store.save_news_batch(records)

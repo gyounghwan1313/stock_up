@@ -13,4 +13,5 @@ class NewsRecord:
     collected_at: datetime
     sentiment_score: Optional[float] = None
     related_symbols: Optional[list[str]] = None
+    categories: Optional[list[str]] = None
     id: Optional[int] = None

@@ -10,6 +10,8 @@ from storage.models import NewsRecord
 
 logger = logging.getLogger(__name__)
 
+from sender.translator import CATEGORIES
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS news (
     id               INTEGER PRIMARY KEY DEFAULT nextval('news_id_seq'),
@@ -22,6 +24,19 @@ CREATE TABLE IF NOT EXISTS news (
     sentiment_score  REAL,
     related_symbols  VARCHAR[],
     title_hash       VARCHAR(64) NOT NULL UNIQUE
+);
+"""
+
+CATEGORIES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS categories (
+    id   INTEGER PRIMARY KEY DEFAULT nextval('categories_id_seq'),
+    name VARCHAR UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS news_categories (
+    news_id      INTEGER REFERENCES news(id),
+    category_id  INTEGER REFERENCES categories(id),
+    PRIMARY KEY (news_id, category_id)
 );
 """
 
@@ -50,6 +65,14 @@ class NewsStore:
     def init_schema(self) -> None:
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS news_id_seq START 1")
         self.conn.execute(SCHEMA_SQL)
+        self.conn.execute("CREATE SEQUENCE IF NOT EXISTS categories_id_seq START 1")
+        self.conn.execute(CATEGORIES_SCHEMA_SQL)
+        # 시드 데이터 삽입
+        for name in CATEGORIES:
+            self.conn.execute(
+                "INSERT INTO categories (name) VALUES (?) ON CONFLICT (name) DO NOTHING",
+                [name],
+            )
         logger.info("DuckDB schema initialized: %s", self.db_path)
 
     def save_news(self, record: NewsRecord) -> Optional[int]:
@@ -81,7 +104,11 @@ class NewsStore:
                 title_hash,
             ],
         ).fetchone()
-        return result[0] if result else None
+
+        news_id = result[0] if result else None
+        if news_id and record.categories:
+            self._save_news_categories(news_id, record.categories)
+        return news_id
 
     def save_news_batch(self, records: list[NewsRecord]) -> int:
         saved = 0
@@ -162,11 +189,55 @@ class NewsStore:
     def update_related_symbols(self, news_id: int, symbols: list[str]) -> None:
         self.conn.execute("UPDATE news SET related_symbols = ? WHERE id = ?", [symbols, news_id])
 
+    def search_by_category(self, category_name: str, days: int = 30, limit: int = 50) -> list[NewsRecord]:
+        sql = f"""
+            SELECT DISTINCT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            FROM news n
+            JOIN news_categories nc ON n.id = nc.news_id
+            JOIN categories c ON nc.category_id = c.id
+            WHERE c.name = ?
+              AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            ORDER BY n.published_at DESC NULLS LAST
+            LIMIT ?
+        """
+        return self._fetch_records(sql, [category_name, limit])
+
+    def get_all_categories(self) -> list[dict]:
+        rows = self.conn.execute("SELECT id, name FROM categories ORDER BY id").fetchall()
+        return [{"id": row[0], "name": row[1]} for row in rows]
+
+    def update_categories(self, news_id: int, category_names: list[str]) -> None:
+        self.conn.execute("DELETE FROM news_categories WHERE news_id = ?", [news_id])
+        self._save_news_categories(news_id, category_names)
+
+    def _save_news_categories(self, news_id: int, category_names: list[str]) -> None:
+        for name in category_names:
+            cat = self.conn.execute(
+                "SELECT id FROM categories WHERE name = ?", [name]
+            ).fetchone()
+            if cat:
+                self.conn.execute(
+                    "INSERT INTO news_categories (news_id, category_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                    [news_id, cat[0]],
+                )
+
     def _fetch_records(self, sql: str, params: list) -> list[NewsRecord]:
         rows = self.conn.execute(sql, params).fetchall()
-        return [
-            NewsRecord(
-                id=row[0],
+        records = []
+        for row in rows:
+            news_id = row[0]
+            # 카테고리 조회
+            cat_rows = self.conn.execute(
+                """SELECT c.name FROM categories c
+                   JOIN news_categories nc ON c.id = nc.category_id
+                   WHERE nc.news_id = ?""",
+                [news_id],
+            ).fetchall()
+            categories = [r[0] for r in cat_rows] if cat_rows else None
+
+            records.append(NewsRecord(
+                id=news_id,
                 title_original=row[1],
                 title_translated=row[2],
                 source=row[3],
@@ -175,9 +246,9 @@ class NewsStore:
                 collected_at=row[6],
                 sentiment_score=row[7],
                 related_symbols=row[8],
-            )
-            for row in rows
-        ]
+                categories=categories,
+            ))
+        return records
 
     def close(self) -> None:
         if self._conn:

@@ -1,5 +1,6 @@
 import io
 import logging
+import time
 
 import pandas as pd
 import requests
@@ -166,6 +167,7 @@ class StockScreener:
         results: list[ScreenerResult] = []
         for sym, df, rsi_val in pre_filtered:
             try:
+                time.sleep(0.5)
                 info = yf.Ticker(sym).info
                 market_cap = info.get("marketCap", 0) or 0
                 trailing_pe = info.get("trailingPE")

@@ -9,29 +9,56 @@ from openai import OpenAI
 logger = logging.getLogger(__name__)
 
 
+CATEGORIES = [
+    "금리/통화정책", "인플레이션/물가", "고용/노동시장", "기업실적",
+    "반도체/AI", "에너지/원자재", "지정학/무역", "부동산/건설",
+    "암호화폐/디지털자산", "은행/금융", "소비/유통", "IPO/M&A",
+    "규제/정책", "기술/소프트웨어", "헬스케어/바이오", "기타",
+]
+
+
 class GPTTranslator:
     """GPT를 사용한 경제 뉴스 번역기"""
-    
+
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-3.5-turbo"):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
             raise ValueError("OpenAI API 키가 필요합니다. OPENAI_API_KEY 환경변수를 설정하거나 api_key 파라미터를 제공하세요.")
-        
+
         self.client = OpenAI(api_key=self.api_key)
         self.model = model
-        
+
         # 경제 뉴스 번역을 위한 시스템 프롬프트
         self.system_prompt = """
-You are a professional translator specialized in economics and finance.  
-When I provide an English news title about the economy, translate it into Korean.  
+You are a professional translator specialized in economics and finance.
+When I provide an English news title about the economy, translate it into Korean.
 
-Translation rules:  
-- Use a clear and reader-friendly explanatory tone (해설체), not a rigid newspaper style.  
-- Keep important economic/financial terms in Korean with the original English term in parentheses the first time they appear.  
-  Example: 물가 상승(Inflation), 금리 인하(interest rate cut)  
-- Break down long sentences into shorter, easy-to-read sentences.  
-- Ensure the translation is natural and understandable for general Korean readers without losing the economic nuance.  
+Translation rules:
+- Use a clear and reader-friendly explanatory tone (해설체), not a rigid newspaper style.
+- Keep important economic/financial terms in Korean with the original English term in parentheses the first time they appear.
+  Example: 물가 상승(Inflation), 금리 인하(interest rate cut)
+- Break down long sentences into shorter, easy-to-read sentences.
+- Ensure the translation is natural and understandable for general Korean readers without losing the economic nuance.
 - Only respond with the translated title, nothing else.
+"""
+
+        categories_str = ", ".join(CATEGORIES)
+        self.categorize_system_prompt = f"""
+You are a professional translator and news categorizer specialized in economics and finance.
+When I provide an English news title about the economy, do two things:
+1. Translate it into Korean.
+2. Assign 1-3 categories from the following list that best describe the news topic.
+
+Available categories: {categories_str}
+
+Translation rules:
+- Use a clear and reader-friendly explanatory tone (해설체), not a rigid newspaper style.
+- Keep important economic/financial terms in Korean with the original English term in parentheses the first time they appear.
+- Break down long sentences into shorter, easy-to-read sentences.
+- Ensure the translation is natural and understandable for general Korean readers without losing the economic nuance.
+
+Respond ONLY with valid JSON in this format:
+{{"translation": "번역된 제목", "categories": ["카테고리1", "카테고리2"]}}
 """
     
     def translate_title(self, english_title: str) -> str:
@@ -75,6 +102,74 @@ Translation rules:
         
         return translated_titles
     
+    def translate_and_categorize(self, english_title: str) -> tuple[str, List[str]]:
+        """단일 제목을 번역하고 카테고리를 태깅합니다.
+
+        Returns:
+            (번역된 제목, 카테고리 이름 리스트) 튜플
+        """
+        try:
+            request_params = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.categorize_system_prompt},
+                    {"role": "user", "content": english_title},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 300,
+                "response_format": {"type": "json_object"},
+            }
+            logger.debug("OpenAI categorize request: %s", json.dumps(request_params, ensure_ascii=False))
+            response = self.client.chat.completions.create(**request_params)
+
+            content = response.choices[0].message.content.strip()
+            logger.debug("OpenAI categorize response: %s", content)
+
+            data = json.loads(content)
+            translated = data.get("translation", english_title)
+            categories = data.get("categories", [])
+
+            # 따옴표 제거
+            if translated.startswith('"') and translated.endswith('"'):
+                translated = translated[1:-1]
+
+            # 유효한 카테고리만 필터링
+            valid_categories = [c for c in categories if c in CATEGORIES]
+            if not valid_categories:
+                valid_categories = ["기타"]
+
+            return translated, valid_categories
+
+        except Exception as e:
+            logger.error("번역+카테고리 태깅 중 오류 발생: %s", e)
+            return english_title, ["기타"]
+
+    def translate_and_categorize_titles(
+        self, english_titles: List[str], delay: float = 1.0
+    ) -> tuple[List[str], List[List[str]]]:
+        """여러 제목을 번역 + 카테고리 태깅합니다.
+
+        Returns:
+            (번역 리스트, 카테고리 리스트) 튜플
+        """
+        translated_titles = []
+        categories_list = []
+
+        for i, title in enumerate(english_titles):
+            if i > 0:
+                time.sleep(delay)
+
+            translated, categories = self.translate_and_categorize(title)
+            translated_titles.append(translated)
+            categories_list.append(categories)
+            logger.info(
+                "번역+카테고리 완료 (%d/%d): %s... → %s... [%s]",
+                i + 1, len(english_titles), title[:50], translated[:50],
+                ", ".join(categories),
+            )
+
+        return translated_titles, categories_list
+
     def translate_batch(self, english_titles: List[str], batch_size: int = 5) -> List[str]:
         """배치로 여러 제목을 번역합니다"""
         if not english_titles:
