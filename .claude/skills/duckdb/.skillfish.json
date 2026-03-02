@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "duckdb",
+  "owner": "tondevrel",
+  "repo": "scientific-agent-skills",
+  "path": "skills/duckdb",
+  "branch": "main",
+  "sha": "6ee1ab61b4e2bc7ecc8ba689b8a23ec2c1b28448",
+  "source": "manual"
+}
