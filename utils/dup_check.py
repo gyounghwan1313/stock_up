@@ -44,6 +44,23 @@ class DuplicateChecker:
         return result_dict
 
 
+    def check_signal_duplicate(self, symbol: str, signal_type: str) -> bool:
+        """같은 날 동일 종목+시그널이 이미 발생했는지 확인"""
+        key = f"signal_{symbol}_{signal_type}"
+        file_name = f"{hash_title(key)}.txt"
+        return self.is_file_exist(file_name) is None
+
+    def mark_signal_sent(self, symbol: str, signal_type: str) -> None:
+        """시그널 전송 기록"""
+        from utils.file_ctrl import save_file
+
+        key = f"signal_{symbol}_{signal_type}"
+        file_name = f"{hash_title(key)}.txt"
+        file_path = self.is_file_exist(file_name)
+        if file_path:
+            save_file(file_path=file_path, title=key)
+
+
 if __name__ == '__main__':
     checker = DuplicateChecker()
 

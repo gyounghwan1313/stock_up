@@ -1,0 +1,39 @@
+# Stock Up - 주식 관련 뉴스 알림 서비스
+
+## 프로젝트 개요
+주식 데이터를 수집하고 가격에 영향을 크게 미치는 정보일 경우 Slack으로 사용자에게 알림을 주는 서비스입니다.
+
+## 주요 기능
+- RSS 피드에서 금융 뉴스 수집 (FinancialJuice 등)
+- 중복 뉴스 필터링 (원본 영어 기준)
+- GPT를 활용한 영문 뉴스 번역 + 위급도 판단 (신규 뉴스만)
+- Slack 웹훅을 통한 알림 발송 (위급 시에만)
+
+## 처리 흐름
+```
+RSS 파싱 → 중복체크(원본 영어) → 번역+위급도(신규만) → Slack(위급 시) → 저장
+```
+
+## 프로젝트 구조
+- `crawler/`: RSS 데이터 수집 및 파싱
+  - `rss_fetcher.py`: RSS URL에서 XML 데이터 가져오기
+  - `rss_parser.py`: RSS XML 파싱하여 뉴스 항목 추출
+- `sender/`: 알림 발송 관련 모듈
+  - `translator.py`: OpenAI GPT를 사용한 번역
+  - `slack_sender.py`: Slack 웹훅 알림 발송
+- `utils/`: 유틸리티 모듈
+  - `dup_check.py`: 중복 뉴스 체크
+  - `file_ctrl.py`: 파일 저장 기능
+- `main.py`: 메인 실행 파일 (5분 주기로 RSS 수집 및 알림)
+
+## 기술 스택
+- Python 3.x
+- uv (패키지 관리)
+- OpenAI API (번역)
+- Slack Webhook API (알림)
+
+## 환경 변수
+- `RSS_URL`: RSS 피드 URL
+- `SLACK_WEBHOOK_URL`: Slack 웹훅 URL
+- `SLACK_BOT_TOKEN`: Slack 봇 토큰
+- `OPENAI_API_KEY`: OpenAI API 키

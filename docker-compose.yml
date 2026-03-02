@@ -1,0 +1,10 @@
+services:
+  stock-up:
+    build: .
+    container_name: stock_up
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data       # duckdb + portfolio 데이터 영속화
+      - ./config.yaml:/app/config.yaml  # 설정 변경 시 재빌드 불필요

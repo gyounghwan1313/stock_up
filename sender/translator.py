@@ -1,7 +1,12 @@
+import json
+import logging
 import os
-from typing import List, Optional
-from openai import OpenAI
 import time
+from typing import List, Optional
+
+from openai import OpenAI
+
+logger = logging.getLogger(__name__)
 
 
 class GPTTranslator:
@@ -32,25 +37,28 @@ Translation rules:
     def translate_title(self, english_title: str) -> str:
         """단일 제목을 번역합니다"""
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            request_params = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": english_title}
+                    {"role": "user", "content": english_title},
                 ],
-                temperature=0.3,
-                max_tokens=150
-            )
+                "temperature": 0.3,
+                "max_tokens": 150,
+            }
+            logger.debug("OpenAI request: %s", json.dumps(request_params, ensure_ascii=False))
+            response = self.client.chat.completions.create(**request_params)
             
             translated = response.choices[0].message.content.strip()
+            logger.debug("OpenAI response: %s", translated)
             # 따옴표 제거
             if translated.startswith('"') and translated.endswith('"'):
                 translated = translated[1:-1]
-            
+
             return translated
-            
+
         except Exception as e:
-            print(f"번역 중 오류 발생: {e}")
+            logger.error("번역 중 오류 발생: %s", e)
             return english_title  # 번역 실패시 원문 반환
     
     def translate_titles(self, english_titles: List[str], delay: float = 1.0) -> List[str]:
@@ -60,10 +68,10 @@ Translation rules:
         for i, title in enumerate(english_titles):
             if i > 0:  # 첫 번째 호출이 아닌 경우 지연
                 time.sleep(delay)
-            
+
             translated = self.translate_title(title)
             translated_titles.append(translated)
-            print(f"번역 완료 ({i+1}/{len(english_titles)}): {title[:50]}... → {translated[:50]}...")
+            logger.info("번역 완료 (%d/%d): %s... → %s...", i + 1, len(english_titles), title[:50], translated[:50])
         
         return translated_titles
     
@@ -76,18 +84,21 @@ Translation rules:
         titles_text = "\n".join([f"{i+1}. {title}" for i, title in enumerate(english_titles[:batch_size])])
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
+            request_params = {
+                "model": self.model,
+                "messages": [
                     {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": f"다음 경제 뉴스 제목들을 한국어로 번역해주세요. 각 번호에 맞춰 번역된 제목만 응답해주세요:\n\n{titles_text}"}
+                    {"role": "user", "content": f"다음 경제 뉴스 제목들을 한국어로 번역해주세요. 각 번호에 맞춰 번역된 제목만 응답해주세요:\n\n{titles_text}"},
                 ],
-                temperature=0.3,
-                max_tokens=500
-            )
+                "temperature": 0.3,
+                "max_tokens": 500,
+            }
+            logger.debug("OpenAI batch request: %s", json.dumps(request_params, ensure_ascii=False))
+            response = self.client.chat.completions.create(**request_params)
             
             translated_text = response.choices[0].message.content.strip()
-            
+            logger.debug("OpenAI batch response: %s", translated_text)
+
             # 번호별로 분리
             translated_titles = []
             lines = translated_text.split('\n')
@@ -110,5 +121,5 @@ Translation rules:
             return translated_titles[:len(english_titles)]
             
         except Exception as e:
-            print(f"배치 번역 중 오류 발생: {e}")
+            logger.error("배치 번역 중 오류 발생: %s", e)
             return english_titles  # 번역 실패시 원문 반환

@@ -1,4 +1,5 @@
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
+from xml.etree.ElementTree import Element
 from datetime import datetime
 from typing import List, Dict, Optional
 import re
@@ -56,7 +57,7 @@ class RSSParser:
         except Exception as e:
             raise ValueError(f"RSS 파싱 중 오류 발생: {e}")
     
-    def _extract_text(self, item: ET.Element, tag_name: str) -> str:
+    def _extract_text(self, item: Element, tag_name: str) -> str:
         """XML 요소에서 텍스트를 추출합니다"""
         element = item.find(tag_name)
         if element is not None and element.text:
@@ -67,7 +68,7 @@ class RSSParser:
             return text
         return ""
     
-    def _parse_pub_date(self, item: ET.Element) -> Optional[datetime]:
+    def _parse_pub_date(self, item: Element) -> Optional[datetime]:
         """pubDate를 파싱합니다"""
         pub_date_text = self._extract_text(item, 'pubDate')
         if not pub_date_text:
