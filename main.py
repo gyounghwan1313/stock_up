@@ -380,6 +380,35 @@ def discover_new_stocks(config: dict, watchlist: list[str] | None = None) -> lis
         return []
 
 
+def backfill_categories(news_store, delay: float = 1.0) -> int:
+    """기존 뉴스에 카테고리를 소급 적용합니다."""
+    uncategorized = news_store.get_uncategorized_news()
+    if not uncategorized:
+        logger.info("No uncategorized news found")
+        return 0
+
+    logger.info("Backfilling categories for %d news items", len(uncategorized))
+    translator = GPTTranslator()
+    count = 0
+    for record in uncategorized:
+        try:
+            _, categories = translator.translate_and_categorize(record.title_original)
+            news_store.update_categories(record.id, categories)
+            count += 1
+            logger.info(
+                "Backfill (%d/%d) id=%d: [%s] %s",
+                count, len(uncategorized), record.id,
+                ", ".join(categories), record.title_original[:60],
+            )
+            if count < len(uncategorized):
+                sleep(delay)
+        except Exception as e:
+            logger.error("Backfill failed for id=%d: %s", record.id, e)
+
+    logger.info("Backfill complete: %d/%d categorized", count, len(uncategorized))
+    return count
+
+
 def main():
     load_dotenv()
     config = load_config()
@@ -449,4 +478,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--backfill-categories" in sys.argv:
+        load_dotenv()
+        config = load_config()
+        news_store = _init_news_store(config)
+        if news_store is None:
+            logger.error("Database not enabled in config")
+            sys.exit(1)
+        backfill_categories(news_store)
+        news_store.close()
+    else:
+        main()

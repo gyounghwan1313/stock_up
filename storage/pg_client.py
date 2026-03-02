@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS news_categories (
 
 CREATE INDEX IF NOT EXISTS idx_news_categories_news ON news_categories (news_id);
 CREATE INDEX IF NOT EXISTS idx_news_categories_cat ON news_categories (category_id);
+
+CREATE OR REPLACE VIEW news_with_categories AS
+SELECT n.*,
+       array_agg(c.name ORDER BY c.id) FILTER (WHERE c.name IS NOT NULL) AS categories
+FROM news n
+LEFT JOIN news_categories nc ON n.id = nc.news_id
+LEFT JOIN categories c ON nc.category_id = c.id
+GROUP BY n.id;
 """
 
 

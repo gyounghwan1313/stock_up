@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS news_categories (
     category_id  INTEGER REFERENCES categories(id),
     PRIMARY KEY (news_id, category_id)
 );
+
+CREATE OR REPLACE VIEW news_with_categories AS
+SELECT n.*,
+       list(c.name ORDER BY c.id) AS categories
+FROM news n
+LEFT JOIN news_categories nc ON n.id = nc.news_id
+LEFT JOIN categories c ON nc.category_id = c.id
+GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
+         n.published_at, n.collected_at, n.sentiment_score, n.related_symbols, n.title_hash;
 """
 
 
@@ -249,6 +258,28 @@ class NewsStore:
                 categories=categories,
             ))
         return records
+
+    def get_uncategorized_news(self, limit: int = 500) -> list[NewsRecord]:
+        """카테고리가 없는 뉴스 목록 조회"""
+        sql = """
+            SELECT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            FROM news n
+            LEFT JOIN news_categories nc ON n.id = nc.news_id
+            WHERE nc.news_id IS NULL
+            ORDER BY n.collected_at DESC
+            LIMIT ?
+        """
+        rows = self.conn.execute(sql, [limit]).fetchall()
+        return [
+            NewsRecord(
+                id=row[0], title_original=row[1], title_translated=row[2],
+                source=row[3], link=row[4], published_at=row[5],
+                collected_at=row[6], sentiment_score=row[7],
+                related_symbols=row[8],
+            )
+            for row in rows
+        ]
 
     def close(self) -> None:
         if self._conn:
