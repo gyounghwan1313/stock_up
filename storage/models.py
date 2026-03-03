@@ -14,4 +14,5 @@ class NewsRecord:
     sentiment_score: Optional[float] = None
     related_symbols: Optional[list[str]] = None
     categories: Optional[list[str]] = None
+    embedding: Optional[list[float]] = None
     id: Optional[int] = None

@@ -6,8 +6,9 @@ from time import sleep
 import yfinance as yf
 from dotenv import load_dotenv
 
-# Docker overlay filesystem에서 SQLite lock 방지: 프로세스별 고유 tmpfs 경로 사용
-_tz_cache_dir = f"/tmp/yfinance_tz_cache_{os.getpid()}"
+# Docker overlay filesystem에서 SQLite lock 방지: /dev/shm(ramdisk) 우선, fallback /tmp
+_shm = "/dev/shm" if os.path.isdir("/dev/shm") else "/tmp"
+_tz_cache_dir = os.path.join(_shm, f"yfinance_tz_cache_{os.getpid()}")
 os.makedirs(_tz_cache_dir, exist_ok=True)
 yf.set_tz_cache_location(_tz_cache_dir)
 
@@ -36,8 +37,11 @@ from utils.config_loader import (
     is_discovery_enabled,
     load_config,
 )
-from utils.dup_check import DuplicateChecker
+from utils.dup_check import DuplicateChecker, deduplicate_similar
 from utils.file_ctrl import save_file
+
+# 소스별 타이틀 prefix 매핑
+_SOURCE_PREFIXES = {"financialjuice": "FinancialJuice:"}
 
 _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(level=_log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -75,6 +79,10 @@ def run_news_pipeline(
 ) -> tuple[list[str], dict[str, list[NewsAlertItem]]]:
     """RSS 뉴스 크롤링 → 번역 → 감성점수 계산 → DB 저장 + 파일 저장 파이프라인.
 
+    2단계 구조:
+      Phase 1 - 각 소스에서 수집 + 중복 제거
+      Phase 2 - 전체 신규 건을 통합 배치로 번역/감성분석/저장
+
     Returns:
         (all_headlines, symbol_news_map) 튜플
         symbol_news_map: {symbol: [NewsAlertItem, ...]} — 관련 종목별 뉴스+감성
@@ -88,6 +96,10 @@ def run_news_pipeline(
     if sentiment_cfg.get("enabled"):
         sentiment_analyzer = SentimentAnalyzer(model=sentiment_cfg.get("model", "gpt-4o-mini"))
 
+    # ── Phase 1: 각 소스에서 수집 + 중복 제거 ──
+    # 수집 결과를 중간 구조로 모은다
+    collected: list[dict] = []  # {source, news_item, cleaned_title, file_path}
+
     for news_cfg in news_configs:
         url = news_cfg.get("url")
         source = news_cfg.get("source", "unknown")
@@ -98,82 +110,127 @@ def run_news_pipeline(
             provider = RSSNewsProvider(url)
             news_items = provider.fetch_news()
             items_with_title = [item for item in news_items if item.get("title")]
-            titles = [item["title"].strip("FinancialJuice:").strip() for item in items_with_title]
+
+            prefix = _SOURCE_PREFIXES.get(source, "")
+            titles = [item["title"].removeprefix(prefix).strip() for item in items_with_title]
             all_headlines.extend(titles)
 
-            # 1. 원문 기준 중복 체크
+            # 원문 기준 중복 체크
             dup_result = dup_checker.check(titles)
             new_orig_set = set(dup_result["new"].keys())
-            logger.info("News pipeline: %d new, %d duplicate", len(dup_result["new"]), len(dup_result["duplicate"]))
+            logger.info(
+                "[%s] %d new, %d duplicate",
+                source, len(dup_result["new"]), len(dup_result["duplicate"]),
+            )
 
             if not dup_result["new"]:
                 continue
 
-            # 2. 신규 건만 필터링 (news_item, title 인덱스 정렬 유지)
-            new_pairs = [(item, t) for item, t in zip(items_with_title, titles) if t in new_orig_set]
-            new_news_items = [p[0] for p in new_pairs]
-            new_titles = [p[1] for p in new_pairs]
-
-            # 3. 신규 건 번역 + 카테고리 태깅
-            translator = GPTTranslator()
-            new_translated, new_categories = translator.translate_and_categorize_titles(new_titles)
-            trans_map = dict(zip(new_titles, new_translated))
-            cat_map = dict(zip(new_titles, new_categories))
-
-            # 4. 신규 건만 감성점수 배치 계산
-            if sentiment_analyzer:
-                raw_scores = sentiment_analyzer.analyze_batch(new_titles)
-                new_scores: list[float | None] = list(raw_scores)
-            else:
-                new_scores = [None] * len(new_titles)
-
-            # 5. 파일 저장
-            for orig_title, new_file_path in dup_result["new"].items():
-                save_file(file_path=new_file_path, title=trans_map.get(orig_title, orig_title))
-
-            # 6. Slack 발송
-            news_channel = os.getenv("SLACK_CHANNEL_NEWS")
-            if news_channel:
-                try:
-                    slack = SlackSender()
-                    lines = []
-                    for t in new_titles:
-                        translated = trans_map.get(t, t)
-                        cats = cat_map.get(t, [])
-                        tag = " ".join(f"[{c}]" for c in cats) if cats else ""
-                        lines.append(f"• {tag} {translated}" if tag else f"• {translated}")
-                    msg = "\n".join(lines)
-                    slack.send_bot_message(channel=news_channel, message=msg)
-                except Exception as e:
-                    logger.error("News channel Slack send failed: %s", e)
-
-            # 7. DB 저장
-            if news_store is not None:
-                _save_news_to_db(
-                    news_store, new_news_items, new_titles, new_translated, source, watchlist,
-                    new_scores, new_categories,
-                )
-            else:
-                from storage.symbol_extractor import extract_symbols
-
-                for title in new_titles:
-                    extract_symbols(title, watchlist)
-
-            # 8. symbol_news_map 구축
-            from storage.symbol_extractor import extract_symbols
-
-            for i, title in enumerate(new_titles):
-                score = new_scores[i] if i < len(new_scores) else None
-                if score is None:
-                    continue
-                related = extract_symbols(title, watchlist)
-                for sym in related:
-                    symbol_news_map.setdefault(sym, []).append(
-                        NewsAlertItem(title=title, sentiment_score=score)
-                    )
+            # 신규 건만 필터링
+            for item, title in zip(items_with_title, titles):
+                if title in new_orig_set:
+                    collected.append({
+                        "source": source,
+                        "news_item": item,
+                        "cleaned_title": title,
+                        "file_path": dup_result["new"].get(title),
+                    })
 
         except Exception as e:
-            logger.error("News pipeline error: %s", e)
+            logger.error("[%s] News fetch error: %s", source, e)
+
+    if not collected:
+        return all_headlines, symbol_news_map
+
+    # ── Phase 1.5: 유사 뉴스 중복 제거 ──
+    dedup_cfg = config.get("news_dedup", {})
+    similarity_threshold = dedup_cfg.get("similarity_threshold", 0.65)
+    collected = deduplicate_similar(collected, threshold=similarity_threshold)
+
+    if not collected:
+        return all_headlines, symbol_news_map
+
+    # ── Phase 2: 통합 배치 처리 ──
+    embed_map: dict[str, list[float]] = {
+        c["cleaned_title"]: c["embedding"]
+        for c in collected
+        if c.get("embedding") is not None
+    }
+    all_new_titles = [c["cleaned_title"] for c in collected]
+    logger.info("Phase 2: processing %d new items from %d sources",
+                len(all_new_titles), len({c["source"] for c in collected}))
+
+    # 2-1. 번역 + 카테고리 태깅 (GPT 배치 1회)
+    translator = GPTTranslator()
+    all_translated, all_categories = translator.translate_and_categorize_titles(all_new_titles)
+    trans_map = dict(zip(all_new_titles, all_translated))
+    cat_map = dict(zip(all_new_titles, all_categories))
+
+    # 2-2. 감성점수 배치 계산
+    if sentiment_analyzer:
+        raw_scores = sentiment_analyzer.analyze_batch(all_new_titles)
+        all_scores: list[float | None] = list(raw_scores)
+    else:
+        all_scores = [None] * len(all_new_titles)
+    score_map = dict(zip(all_new_titles, all_scores))
+
+    # 2-3. 파일 저장
+    for c in collected:
+        if c["file_path"]:
+            title = c["cleaned_title"]
+            save_file(file_path=c["file_path"], title=trans_map.get(title, title))
+
+    # 2-4. Slack 발송
+    news_channel = os.getenv("SLACK_CHANNEL_NEWS")
+    if news_channel:
+        try:
+            slack = SlackSender()
+            lines = []
+            for title in all_new_titles:
+                translated = trans_map.get(title, title)
+                cats = cat_map.get(title, [])
+                tag = " ".join(f"[{c}]" for c in cats) if cats else ""
+                lines.append(f"• {tag} {translated}" if tag else f"• {translated}")
+            msg = "\n".join(lines)
+            slack.send_bot_message(channel=news_channel, message=msg)
+        except Exception as e:
+            logger.error("News channel Slack send failed: %s", e)
+
+    # 2-5. DB 저장 (소스별로 묶어서 저장)
+    if news_store is not None:
+        # 소스별로 그룹핑
+        from itertools import groupby
+        from operator import itemgetter
+
+        for source, group in groupby(collected, key=itemgetter("source")):
+            items_in_source = list(group)
+            src_news_items = [c["news_item"] for c in items_in_source]
+            src_titles = [c["cleaned_title"] for c in items_in_source]
+            src_translated = [trans_map.get(t, t) for t in src_titles]
+            src_scores = [score_map.get(t) for t in src_titles]
+            src_categories = [cat_map.get(t, []) for t in src_titles]
+            src_embeddings = [embed_map.get(t) for t in src_titles]
+            _save_news_to_db(
+                news_store, src_news_items, src_titles, src_translated,
+                source, watchlist, src_scores, src_categories, src_embeddings,
+            )
+    else:
+        from storage.symbol_extractor import extract_symbols
+        for title in all_new_titles:
+            extract_symbols(title, watchlist)
+
+    # 2-6. symbol_news_map 구축
+    from storage.symbol_extractor import extract_symbols
+
+    for title in all_new_titles:
+        score = score_map.get(title)
+        if score is None:
+            continue
+        related = extract_symbols(title, watchlist)
+        for sym in related:
+            symbol_news_map.setdefault(sym, []).append(
+                NewsAlertItem(title=title, sentiment_score=score)
+            )
 
     return all_headlines, symbol_news_map
 
@@ -182,6 +239,7 @@ def _save_news_to_db(
     news_store, news_items, titles, translated, source, watchlist,
     sentiment_scores: list[float | None] | None = None,
     categories_list: list[list[str]] | None = None,
+    embeddings: list[list[float] | None] | None = None,
 ) -> set[str]:
     """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리도 즉시 포함.
 
@@ -210,6 +268,7 @@ def _save_news_to_db(
 
         score = sentiment_scores[i] if sentiment_scores and i < len(sentiment_scores) else None
         cats = categories_list[i] if categories_list and i < len(categories_list) else None
+        emb = embeddings[i] if embeddings and i < len(embeddings) else None
 
         records.append(NewsRecord(
             title_original=original,
@@ -221,6 +280,7 @@ def _save_news_to_db(
             sentiment_score=score,
             related_symbols=related if related else None,
             categories=cats,
+            embedding=emb,
         ))
 
     news_store.save_news_batch(records)

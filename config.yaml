@@ -26,7 +26,12 @@ providers:
   news:
     - source: financialjuice
       url: "https://www.financialjuice.com/feed.ashx?xy=rss"
-      interval_seconds: 300 # 뉴스 수집 주기 (300초 = 5분)
+    - source: forexlive
+      url: "https://www.forexlive.com/feed/"
+    - source: investing_com
+      url: "https://www.investing.com/rss/news.rss"
+    - source: federal_reserve
+      url: "https://www.federalreserve.gov/feeds/press_all.xml"
 
 # 매매 규칙
 rules:
@@ -91,6 +96,10 @@ news_evaluation:
     bollinger: 0.25
   # 알림 발송 기준 (composite_score 절대값)
   alert_threshold: 0.4
+
+# 유사 뉴스 중복 제거 설정
+news_dedup:
+  similarity_threshold: 0.85  # 코사인 유사도 임계값 (0.0~1.0, 높을수록 엄격 / embedding 기준)
 
 # 전체 시스템 폴링 주기 (300초 = 5분)
 poll_interval_seconds: 300

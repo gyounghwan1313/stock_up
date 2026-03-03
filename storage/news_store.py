@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS news (
 );
 """
 
+INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_news_collected_at ON news(collected_at);
+CREATE INDEX IF NOT EXISTS idx_news_source ON news(source);
+CREATE INDEX IF NOT EXISTS idx_news_published_at ON news(published_at);
+"""
+
 CATEGORIES_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS categories (
     id   INTEGER PRIMARY KEY DEFAULT nextval('categories_id_seq'),
@@ -46,7 +52,8 @@ FROM news n
 LEFT JOIN news_categories nc ON n.id = nc.news_id
 LEFT JOIN categories c ON nc.category_id = c.id
 GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
-         n.published_at, n.collected_at, n.sentiment_score, n.related_symbols, n.title_hash;
+         n.published_at, n.collected_at, n.sentiment_score, n.related_symbols, n.title_hash,
+         n.embedding;
 """
 
 
@@ -74,6 +81,9 @@ class NewsStore:
     def init_schema(self) -> None:
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS news_id_seq START 1")
         self.conn.execute(SCHEMA_SQL)
+        self.conn.execute(INDEX_SQL)
+        # 기존 DB 마이그레이션: embedding 컬럼 추가 (VIEW 생성 전에 실행)
+        self.conn.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS embedding FLOAT[]")
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS categories_id_seq START 1")
         self.conn.execute(CATEGORIES_SCHEMA_SQL)
         # 시드 데이터 삽입
@@ -97,8 +107,8 @@ class NewsStore:
             """
             INSERT INTO news (title_original, title_translated, source, link,
                               published_at, collected_at, sentiment_score,
-                              related_symbols, title_hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              related_symbols, title_hash, embedding)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             [
@@ -111,6 +121,7 @@ class NewsStore:
                 record.sentiment_score,
                 record.related_symbols,
                 title_hash,
+                record.embedding,
             ],
         ).fetchone()
 
@@ -120,22 +131,34 @@ class NewsStore:
         return news_id
 
     def save_news_batch(self, records: list[NewsRecord]) -> int:
+        """배치로 뉴스 레코드를 저장합니다 (트랜잭션으로 감싸서 I/O 최소화)."""
         saved = 0
-        for record in records:
-            result = self.save_news(record)
-            if result is not None:
-                saved += 1
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            for record in records:
+                result = self.save_news(record)
+                if result is not None:
+                    saved += 1
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
         logger.info("Saved %d/%d news records", saved, len(records))
         return saved
 
     def search_by_keyword(self, keyword: str, days: int = 30, limit: int = 50) -> list[NewsRecord]:
         sql = f"""
-            SELECT id, title_original, title_translated, source, link,
-                   published_at, collected_at, sentiment_score, related_symbols
-            FROM news
-            WHERE (title_original ILIKE ? OR title_translated ILIKE ?)
-              AND collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
-            ORDER BY published_at DESC NULLS LAST
+            SELECT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols,
+                   list(c.name ORDER BY c.id) AS categories
+            FROM news n
+            LEFT JOIN news_categories nc ON n.id = nc.news_id
+            LEFT JOIN categories c ON nc.category_id = c.id
+            WHERE (n.title_original ILIKE ? OR n.title_translated ILIKE ?)
+              AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
+                     n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            ORDER BY n.published_at DESC NULLS LAST
             LIMIT ?
         """
         pattern = f"%{keyword}%"
@@ -143,12 +166,17 @@ class NewsStore:
 
     def search_by_symbol(self, symbol: str, days: int = 30, limit: int = 50) -> list[NewsRecord]:
         sql = f"""
-            SELECT id, title_original, title_translated, source, link,
-                   published_at, collected_at, sentiment_score, related_symbols
-            FROM news
-            WHERE list_contains(related_symbols, ?)
-              AND collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
-            ORDER BY published_at DESC NULLS LAST
+            SELECT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols,
+                   list(c.name ORDER BY c.id) AS categories
+            FROM news n
+            LEFT JOIN news_categories nc ON n.id = nc.news_id
+            LEFT JOIN categories c ON nc.category_id = c.id
+            WHERE list_contains(n.related_symbols, ?)
+              AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
+                     n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            ORDER BY n.published_at DESC NULLS LAST
             LIMIT ?
         """
         return self._fetch_records(sql, [symbol, limit])
@@ -170,24 +198,34 @@ class NewsStore:
 
     def get_recent_headlines(self, hours: int = 24, limit: int = 100) -> list[NewsRecord]:
         sql = f"""
-            SELECT id, title_original, title_translated, source, link,
-                   published_at, collected_at, sentiment_score, related_symbols
-            FROM news
-            WHERE collected_at >= CURRENT_TIMESTAMP - {_interval(hours, 'HOUR')}
-            ORDER BY published_at DESC NULLS LAST
+            SELECT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols,
+                   list(c.name ORDER BY c.id) AS categories
+            FROM news n
+            LEFT JOIN news_categories nc ON n.id = nc.news_id
+            LEFT JOIN categories c ON nc.category_id = c.id
+            WHERE n.collected_at >= CURRENT_TIMESTAMP - {_interval(hours, 'HOUR')}
+            GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
+                     n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            ORDER BY n.published_at DESC NULLS LAST
             LIMIT ?
         """
         return self._fetch_records(sql, [limit])
 
     def get_negative_news(self, threshold: float = -0.3, days: int = 7, limit: int = 50) -> list[NewsRecord]:
         sql = f"""
-            SELECT id, title_original, title_translated, source, link,
-                   published_at, collected_at, sentiment_score, related_symbols
-            FROM news
-            WHERE sentiment_score IS NOT NULL
-              AND sentiment_score <= ?
-              AND collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
-            ORDER BY sentiment_score ASC
+            SELECT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols,
+                   list(c.name ORDER BY c.id) AS categories
+            FROM news n
+            LEFT JOIN news_categories nc ON n.id = nc.news_id
+            LEFT JOIN categories c ON nc.category_id = c.id
+            WHERE n.sentiment_score IS NOT NULL
+              AND n.sentiment_score <= ?
+              AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
+                     n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            ORDER BY n.sentiment_score ASC
             LIMIT ?
         """
         return self._fetch_records(sql, [threshold, limit])
@@ -195,18 +233,62 @@ class NewsStore:
     def update_sentiment(self, news_id: int, score: float) -> None:
         self.conn.execute("UPDATE news SET sentiment_score = ? WHERE id = ?", [score, news_id])
 
+    def update_embedding(self, news_id: int, vector: list[float]) -> None:
+        self.conn.execute("UPDATE news SET embedding = ? WHERE id = ?", [vector, news_id])
+
+    def get_news_for_clustering(self, days: int = 30, limit: int = 5000) -> list[dict]:
+        """클러스터링용 — id, 제목, embedding을 함께 반환. embedding이 있는 것만 조회."""
+        sql = f"""
+            SELECT id, title_original, title_translated, embedding
+            FROM news
+            WHERE embedding IS NOT NULL
+              AND collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            ORDER BY collected_at DESC
+            LIMIT ?
+        """
+        rows = self.conn.execute(sql, [limit]).fetchall()
+        return [
+            {"id": row[0], "title_original": row[1], "title_translated": row[2], "embedding": list(row[3])}
+            for row in rows
+        ]
+
+    def get_news_without_embeddings(self, limit: int = 500) -> list[NewsRecord]:
+        """embedding이 없는 뉴스 조회 — 소급 적용(backfill)용."""
+        sql = """
+            SELECT id, title_original, title_translated, source, link,
+                   published_at, collected_at, sentiment_score, related_symbols
+            FROM news
+            WHERE embedding IS NULL
+            ORDER BY collected_at DESC
+            LIMIT ?
+        """
+        rows = self.conn.execute(sql, [limit]).fetchall()
+        return [
+            NewsRecord(
+                id=row[0], title_original=row[1], title_translated=row[2],
+                source=row[3], link=row[4], published_at=row[5],
+                collected_at=row[6], sentiment_score=row[7], related_symbols=row[8],
+            )
+            for row in rows
+        ]
+
     def update_related_symbols(self, news_id: int, symbols: list[str]) -> None:
         self.conn.execute("UPDATE news SET related_symbols = ? WHERE id = ?", [symbols, news_id])
 
     def search_by_category(self, category_name: str, days: int = 30, limit: int = 50) -> list[NewsRecord]:
         sql = f"""
-            SELECT DISTINCT n.id, n.title_original, n.title_translated, n.source, n.link,
-                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
+            SELECT n.id, n.title_original, n.title_translated, n.source, n.link,
+                   n.published_at, n.collected_at, n.sentiment_score, n.related_symbols,
+                   list(c2.name ORDER BY c2.id) AS categories
             FROM news n
             JOIN news_categories nc ON n.id = nc.news_id
             JOIN categories c ON nc.category_id = c.id
+            LEFT JOIN news_categories nc2 ON n.id = nc2.news_id
+            LEFT JOIN categories c2 ON nc2.category_id = c2.id
             WHERE c.name = ?
               AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
+                     n.published_at, n.collected_at, n.sentiment_score, n.related_symbols
             ORDER BY n.published_at DESC NULLS LAST
             LIMIT ?
         """
@@ -232,21 +314,17 @@ class NewsStore:
                 )
 
     def _fetch_records(self, sql: str, params: list) -> list[NewsRecord]:
+        """쿼리 결과를 NewsRecord 리스트로 변환 (카테고리 JOIN 포함)."""
         rows = self.conn.execute(sql, params).fetchall()
         records = []
         for row in rows:
-            news_id = row[0]
-            # 카테고리 조회
-            cat_rows = self.conn.execute(
-                """SELECT c.name FROM categories c
-                   JOIN news_categories nc ON c.id = nc.category_id
-                   WHERE nc.news_id = ?""",
-                [news_id],
-            ).fetchall()
-            categories = [r[0] for r in cat_rows] if cat_rows else None
+            # JOIN으로 가져온 categories 컬럼 (인덱스 9)
+            raw_categories = row[9] if len(row) > 9 else None
+            # DuckDB list()는 NULL 값을 포함할 수 있으므로 필터링
+            categories = [c for c in raw_categories if c is not None] if raw_categories else None
 
             records.append(NewsRecord(
-                id=news_id,
+                id=row[0],
                 title_original=row[1],
                 title_translated=row[2],
                 source=row[3],
@@ -255,7 +333,7 @@ class NewsStore:
                 collected_at=row[6],
                 sentiment_score=row[7],
                 related_symbols=row[8],
-                categories=categories,
+                categories=categories if categories else None,
             ))
         return records
 
