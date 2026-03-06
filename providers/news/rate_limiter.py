@@ -34,6 +34,10 @@ class RateLimiter:
             logger.warning("Failed to save rate limiter state: %s", e)
 
     def wait_if_needed(self, source: str, interval_seconds: int) -> None:
+        """마지막 호출 기록 시각으로부터 interval_seconds가 경과할 때까지 대기.
+
+        호출 시각 갱신은 mark_called()로 별도 수행해야 한다.
+        """
         now = time.time()
         last = self._last_call.get(source, 0)
         elapsed = now - last
@@ -41,6 +45,9 @@ class RateLimiter:
             wait_time = interval_seconds - elapsed
             logger.info("Rate limit: waiting %.1fs for %s", wait_time, source)
             time.sleep(wait_time)
+
+    def mark_called(self, source: str) -> None:
+        """RSS 호출 완료 시점을 기록한다."""
         self._last_call[source] = time.time()
         self._save_state()
 

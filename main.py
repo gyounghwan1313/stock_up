@@ -593,11 +593,13 @@ def main():
 
     while True:
         try:
-            # Docker 재시작 등으로 인한 429 방지: 마지막 실행 이후 남은 대기 시간만큼 대기
+            # Docker 재시작 포함: 마지막 RSS 호출 시각으로부터 poll_interval 경과 대기
             rate_limiter.wait_if_needed("news_pipeline", poll_interval)
 
             # 1. 뉴스 파이프라인 (감성점수 즉시 계산 + DB 저장)
             headlines, symbol_news_map = run_news_pipeline(config, dup_checker, news_store, all_symbols)
+            # RSS 호출 완료 시각 기록 (다음 루프 / 재시작 시 기준점)
+            rate_limiter.mark_called("news_pipeline")
 
             # 2. 뉴스 트리거 기반 즉시 분석 & 알림
             if symbol_news_map:
@@ -644,9 +646,6 @@ def main():
 
         except Exception as e:
             logger.error("Pipeline error: %s", e)
-
-        logger.info("Sleeping %d seconds...", poll_interval)
-        sleep(poll_interval)
 
 
 if __name__ == "__main__":
