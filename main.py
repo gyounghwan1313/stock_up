@@ -160,11 +160,12 @@ def run_news_pipeline(
     logger.info("Phase 2: processing %d new items from %d sources",
                 len(all_new_titles), len({c["source"] for c in collected}))
 
-    # 2-1. 번역 + 카테고리 태깅 (GPT 배치 1회)
+    # 2-1. 번역 + 카테고리 태깅 + 심볼 추출 (GPT 배치 1회)
     translator = GPTTranslator()
-    all_translated, all_categories = translator.translate_and_categorize_titles(all_new_titles)
+    all_translated, all_categories, all_symbols_per_title = translator.translate_and_categorize_titles(all_new_titles)
     trans_map = dict(zip(all_new_titles, all_translated))
     cat_map = dict(zip(all_new_titles, all_categories))
+    gpt_symbol_map = dict(zip(all_new_titles, all_symbols_per_title))
 
     # 2-2. 감성점수 배치 계산
     if sentiment_analyzer:
@@ -210,23 +211,22 @@ def run_news_pipeline(
             src_scores = [score_map.get(t) for t in src_titles]
             src_categories = [cat_map.get(t, []) for t in src_titles]
             src_embeddings = [embed_map.get(t) for t in src_titles]
+            src_symbols = [gpt_symbol_map.get(t, []) for t in src_titles]
             _save_news_to_db(
                 news_store, src_news_items, src_titles, src_translated,
-                source, watchlist, src_scores, src_categories, src_embeddings,
+                source, watchlist, src_scores, src_categories, src_embeddings, src_symbols,
             )
-    else:
-        from storage.symbol_extractor import extract_symbols
-        for title in all_new_titles:
-            extract_symbols(title, watchlist)
 
-    # 2-6. symbol_news_map 구축
-    from storage.symbol_extractor import extract_symbols
+    # 2-6. symbol_news_map 구축 (GPT 추출 심볼 사용, watchlist 필터링)
+    watchlist_upper = {s.upper() for s in watchlist} if watchlist else set()
 
     for title in all_new_titles:
         score = score_map.get(title)
         if score is None:
             continue
-        related = extract_symbols(title, watchlist)
+        gpt_symbols = gpt_symbol_map.get(title, [])
+        # watchlist에 있는 심볼만 알림 대상으로 사용
+        related = [s for s in gpt_symbols if not watchlist_upper or s in watchlist_upper]
         for sym in related:
             symbol_news_map.setdefault(sym, []).append(
                 NewsAlertItem(title=title, sentiment_score=score)
@@ -240,14 +240,14 @@ def _save_news_to_db(
     sentiment_scores: list[float | None] | None = None,
     categories_list: list[list[str]] | None = None,
     embeddings: list[list[float] | None] | None = None,
+    symbols_list: list[list[str]] | None = None,
 ) -> set[str]:
-    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리도 즉시 포함.
+    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리 + 심볼도 즉시 포함.
 
     Returns:
         관련 종목 심볼 집합
     """
     from storage.models import NewsRecord
-    from storage.symbol_extractor import extract_symbols
 
     records = []
     all_symbols: set[str] = set()
@@ -255,8 +255,8 @@ def _save_news_to_db(
         original = titles[i] if i < len(titles) else item.get("title", "")
         trans = translated[i] if i < len(translated) else original
 
-        # 뉴스에서 관련 종목 자동 추출
-        related = extract_symbols(original, watchlist)
+        # GPT가 추출한 심볼 사용
+        related = symbols_list[i] if symbols_list and i < len(symbols_list) else []
         all_symbols.update(related)
 
         pub_date = None

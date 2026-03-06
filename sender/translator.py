@@ -45,9 +45,10 @@ Translation rules:
         categories_str = ", ".join(CATEGORIES)
         self.categorize_system_prompt = f"""
 You are a professional translator and news categorizer specialized in economics and finance.
-When I provide an English news title about the economy, do two things:
+When I provide an English news title about the economy, do three things:
 1. Translate it into Korean.
 2. Assign 1-3 categories from the following list that best describe the news topic.
+3. Extract stock ticker symbols for companies that are the PRIMARY SUBJECT of the news (not merely mentioned in passing).
 
 Available categories: {categories_str}
 
@@ -57,8 +58,18 @@ Translation rules:
 - Break down long sentences into shorter, easy-to-read sentences.
 - Ensure the translation is natural and understandable for general Korean readers without losing the economic nuance.
 
+Symbol extraction rules:
+- Only include symbols for companies that the news is ABOUT (the main subject/actor).
+- Do NOT include symbols for companies that are only mentioned as context, comparison, or background.
+- Examples:
+  - "JPMorgan raises interest rate forecast" → ["JPM"] (JPMorgan is the subject)
+  - "Fed signals rate cut amid JPMorgan warning" → [] (JPMorgan is just providing context)
+  - "Apple and Microsoft earnings beat estimates" → ["AAPL", "MSFT"] (both are subjects)
+- Use standard US stock ticker symbols (e.g. AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, JPM, GS, etc.)
+- If no company is clearly the primary subject, return an empty array.
+
 Respond ONLY with valid JSON in this format:
-{{"translation": "번역된 제목", "categories": ["카테고리1", "카테고리2"]}}
+{{"translation": "번역된 제목", "categories": ["카테고리1", "카테고리2"], "symbols": ["TICKER1"]}}
 """
     
     def translate_title(self, english_title: str) -> str:
@@ -102,11 +113,11 @@ Respond ONLY with valid JSON in this format:
         
         return translated_titles
     
-    def translate_and_categorize(self, english_title: str) -> tuple[str, List[str]]:
-        """단일 제목을 번역하고 카테고리를 태깅합니다.
+    def translate_and_categorize(self, english_title: str) -> tuple[str, List[str], List[str]]:
+        """단일 제목을 번역하고 카테고리를 태깅하고 관련 심볼을 추출합니다.
 
         Returns:
-            (번역된 제목, 카테고리 이름 리스트) 튜플
+            (번역된 제목, 카테고리 이름 리스트, 심볼 리스트) 튜플
         """
         try:
             request_params = {
@@ -116,7 +127,7 @@ Respond ONLY with valid JSON in this format:
                     {"role": "user", "content": english_title},
                 ],
                 "temperature": 0.3,
-                "max_tokens": 300,
+                "max_tokens": 400,
                 "response_format": {"type": "json_object"},
             }
             logger.debug("OpenAI categorize request: %s", json.dumps(request_params, ensure_ascii=False))
@@ -128,6 +139,7 @@ Respond ONLY with valid JSON in this format:
             data = json.loads(content)
             translated = data.get("translation", english_title)
             categories = data.get("categories", [])
+            symbols = data.get("symbols", [])
 
             # 따옴표 제거
             if translated.startswith('"') and translated.endswith('"'):
@@ -138,37 +150,42 @@ Respond ONLY with valid JSON in this format:
             if not valid_categories:
                 valid_categories = ["기타"]
 
-            return translated, valid_categories
+            # 심볼은 대문자 문자열 리스트로 정규화
+            valid_symbols = [s.upper().strip() for s in symbols if isinstance(s, str) and s.strip()]
+
+            return translated, valid_categories, valid_symbols
 
         except Exception as e:
             logger.error("번역+카테고리 태깅 중 오류 발생: %s", e)
-            return english_title, ["기타"]
+            return english_title, ["기타"], []
 
     def translate_and_categorize_titles(
         self, english_titles: List[str], delay: float = 1.0
-    ) -> tuple[List[str], List[List[str]]]:
-        """여러 제목을 번역 + 카테고리 태깅합니다.
+    ) -> tuple[List[str], List[List[str]], List[List[str]]]:
+        """여러 제목을 번역 + 카테고리 태깅 + 심볼 추출합니다.
 
         Returns:
-            (번역 리스트, 카테고리 리스트) 튜플
+            (번역 리스트, 카테고리 리스트, 심볼 리스트) 튜플
         """
         translated_titles = []
         categories_list = []
+        symbols_list = []
 
         for i, title in enumerate(english_titles):
             if i > 0:
                 time.sleep(delay)
 
-            translated, categories = self.translate_and_categorize(title)
+            translated, categories, symbols = self.translate_and_categorize(title)
             translated_titles.append(translated)
             categories_list.append(categories)
+            symbols_list.append(symbols)
             logger.info(
-                "번역+카테고리 완료 (%d/%d): %s... → %s... [%s]",
+                "번역+카테고리+심볼 완료 (%d/%d): %s... → %s... [%s] {%s}",
                 i + 1, len(english_titles), title[:50], translated[:50],
-                ", ".join(categories),
+                ", ".join(categories), ", ".join(symbols),
             )
 
-        return translated_titles, categories_list
+        return translated_titles, categories_list, symbols_list
 
     def translate_batch(self, english_titles: List[str], batch_size: int = 5) -> List[str]:
         """배치로 여러 제목을 번역합니다"""
