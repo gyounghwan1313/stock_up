@@ -31,6 +31,9 @@ class FundamentalData:
     dividend_yield: Optional[float] = None
     sector: Optional[str] = None
     industry: Optional[str] = None
+    psr: Optional[float] = None
+    roe: Optional[float] = None
+    debt_to_equity: Optional[float] = None
 
 
 @dataclass
