@@ -184,7 +184,7 @@ def run_news_pipeline(
 
     # 2-1. 번역 + 카테고리 태깅 (GPT 배치 1회)
     translator = GPTTranslator()
-    all_translated, all_categories = translator.translate_and_categorize_titles(all_new_titles)
+    all_translated, all_categories, _ = translator.translate_and_categorize_titles(all_new_titles)
     trans_map = dict(zip(all_new_titles, all_translated))
     cat_map = dict(zip(all_new_titles, all_categories))
 
