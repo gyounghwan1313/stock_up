@@ -97,6 +97,21 @@ news_evaluation:
   # 알림 발송 기준 (composite_score 절대값)
   alert_threshold: 0.4
 
+# 섹터 트렌드 분석 & 저평가 종목 발굴
+sector_trend:
+  enabled: true
+  analysis_period_days: 7          # 분석 대상 기간
+  min_sentiment: 0.1               # 최소 평균 감성 점수
+  min_news_count: 3                # 최소 뉴스 건수
+  max_stocks_per_sector: 5         # 섹터당 최대 종목 수
+  schedule_hours_kst: [10, 15]     # KST 실행 시각 (오전 10시, 오후 3시)
+  undervalue_filters:
+    max_per: 20                    # PER 상한
+    max_pbr: 2.0                   # PBR 상한
+    max_rsi: 45                    # RSI 상한
+    min_market_cap: 5_000_000_000  # 시가총액 하한 (50억 달러)
+  llm_model: "gpt-4o-mini"        # AI 내러티브 생성 모델
+
 # 유사 뉴스 중복 제거 설정
 news_dedup:
   similarity_threshold: 0.85  # 코사인 유사도 임계값 (0.0~1.0, 높을수록 엄격 / embedding 기준)

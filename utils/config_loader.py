@@ -44,6 +44,11 @@ def get_discovery_config(config: dict | None = None) -> dict:
     return config.get("stocks", {}).get("discovery", {})
 
 
+def get_sector_trend_config(config: dict | None = None) -> dict:
+    config = config or load_config()
+    return config.get("sector_trend", {})
+
+
 def reload_config(path: str = "config.yaml") -> dict[str, Any]:
     global _config_cache
     _config_cache = None

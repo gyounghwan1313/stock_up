@@ -33,6 +33,7 @@ from sender.slack_sender import SlackSender
 from sender.translator import GPTTranslator
 from utils.config_loader import (
     get_discovery_config,
+    get_sector_trend_config,
     get_watchlist,
     is_discovery_enabled,
     load_config,
@@ -52,7 +53,7 @@ for _noisy_logger in ("yfinance", "httpx", "urllib3", "requests", "peewee"):
 logger = logging.getLogger(__name__)
 
 
-def _init_news_store(config: dict):
+def _init_news_store(config: dict, read_only: bool = False):
     """DB 설정이 있으면 NewsStore를 초기화, 없으면 None 반환"""
     db_cfg = config.get("database", {})
     if not db_cfg.get("enabled", False):
@@ -62,9 +63,10 @@ def _init_news_store(config: dict):
         from storage.news_store import NewsStore
 
         db_path = db_cfg.get("path", "./data/news.duckdb")
-        store = NewsStore(db_path=db_path)
-        store.init_schema()
-        logger.info("DuckDB news store initialized: %s", db_path)
+        store = NewsStore(db_path=db_path, read_only=read_only)
+        if not read_only:
+            store.init_schema()
+        logger.info("DuckDB news store initialized: %s (read_only=%s)", db_path, read_only)
         return store
     except Exception as e:
         logger.warning("DB initialization failed, continuing without DB: %s", e)
@@ -160,12 +162,11 @@ def run_news_pipeline(
     logger.info("Phase 2: processing %d new items from %d sources",
                 len(all_new_titles), len({c["source"] for c in collected}))
 
-    # 2-1. 번역 + 카테고리 태깅 + 심볼 추출 (GPT 배치 1회)
+    # 2-1. 번역 + 카테고리 태깅 (GPT 배치 1회)
     translator = GPTTranslator()
-    all_translated, all_categories, all_symbols_per_title = translator.translate_and_categorize_titles(all_new_titles)
+    all_translated, all_categories = translator.translate_and_categorize_titles(all_new_titles)
     trans_map = dict(zip(all_new_titles, all_translated))
     cat_map = dict(zip(all_new_titles, all_categories))
-    gpt_symbol_map = dict(zip(all_new_titles, all_symbols_per_title))
 
     # 2-2. 감성점수 배치 계산
     if sentiment_analyzer:
@@ -211,22 +212,23 @@ def run_news_pipeline(
             src_scores = [score_map.get(t) for t in src_titles]
             src_categories = [cat_map.get(t, []) for t in src_titles]
             src_embeddings = [embed_map.get(t) for t in src_titles]
-            src_symbols = [gpt_symbol_map.get(t, []) for t in src_titles]
             _save_news_to_db(
                 news_store, src_news_items, src_titles, src_translated,
-                source, watchlist, src_scores, src_categories, src_embeddings, src_symbols,
+                source, watchlist, src_scores, src_categories, src_embeddings,
             )
+    else:
+        from storage.symbol_extractor import extract_symbols
+        for title in all_new_titles:
+            extract_symbols(title, watchlist)
 
-    # 2-6. symbol_news_map 구축 (GPT 추출 심볼 사용, watchlist 필터링)
-    watchlist_upper = {s.upper() for s in watchlist} if watchlist else set()
+    # 2-6. symbol_news_map 구축
+    from storage.symbol_extractor import extract_symbols
 
     for title in all_new_titles:
         score = score_map.get(title)
         if score is None:
             continue
-        gpt_symbols = gpt_symbol_map.get(title, [])
-        # watchlist에 있는 심볼만 알림 대상으로 사용
-        related = [s for s in gpt_symbols if not watchlist_upper or s in watchlist_upper]
+        related = extract_symbols(title, watchlist)
         for sym in related:
             symbol_news_map.setdefault(sym, []).append(
                 NewsAlertItem(title=title, sentiment_score=score)
@@ -240,14 +242,14 @@ def _save_news_to_db(
     sentiment_scores: list[float | None] | None = None,
     categories_list: list[list[str]] | None = None,
     embeddings: list[list[float] | None] | None = None,
-    symbols_list: list[list[str]] | None = None,
 ) -> set[str]:
-    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리 + 심볼도 즉시 포함.
+    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리도 즉시 포함.
 
     Returns:
         관련 종목 심볼 집합
     """
     from storage.models import NewsRecord
+    from storage.symbol_extractor import extract_symbols
 
     records = []
     all_symbols: set[str] = set()
@@ -255,8 +257,8 @@ def _save_news_to_db(
         original = titles[i] if i < len(titles) else item.get("title", "")
         trans = translated[i] if i < len(translated) else original
 
-        # GPT가 추출한 심볼 사용
-        related = symbols_list[i] if symbols_list and i < len(symbols_list) else []
+        # 뉴스에서 관련 종목 자동 추출
+        related = extract_symbols(original, watchlist)
         all_symbols.update(related)
 
         pub_date = None
@@ -469,6 +471,106 @@ def backfill_categories(news_store, delay: float = 1.0) -> int:
     return count
 
 
+def run_sector_trend_pipeline(config: dict, news_store) -> bool:
+    """섹터 트렌드 분석 → 저평가 종목 발굴 → Slack 리포트 전송.
+
+    Returns:
+        True if report was sent successfully, False otherwise.
+    """
+    from engine.sector_trend import (
+        SectorTrendReport,
+        aggregate_category_sentiment,
+        generate_ai_narrative,
+        identify_promising_sectors,
+        screen_undervalued_in_sectors,
+    )
+    from sender.sector_report_formatter import format_sector_trend_report
+
+    st_cfg = get_sector_trend_config(config)
+    if not st_cfg.get("enabled", False):
+        logger.info("Sector trend analysis disabled")
+        return False
+
+    if news_store is None:
+        logger.warning("Sector trend requires database — skipping")
+        return False
+
+    days = st_cfg.get("analysis_period_days", 7)
+    min_sentiment = st_cfg.get("min_sentiment", 0.1)
+    min_news_count = st_cfg.get("min_news_count", 3)
+    llm_model = st_cfg.get("llm_model", "gpt-4o-mini")
+
+    logger.info("=== Sector Trend Analysis Start (%d days) ===", days)
+
+    # 1. 카테고리별 감성 집계
+    trends = aggregate_category_sentiment(news_store, days=days)
+    if not trends:
+        logger.info("No category sentiment data available")
+        return False
+    logger.info("카테고리 %d개 감성 집계 완료", len(trends))
+
+    # 2. 상승 전망 섹터 식별
+    promising = identify_promising_sectors(trends, min_sentiment, min_news_count)
+    logger.info("상승 전망 섹터 %d개 식별", len(promising))
+
+    # 3. 섹터별 저평가 종목 스크리닝
+    sector_candidates: dict[str, list] = {}
+    for trend, mapping in promising:
+        sectors = mapping.get("sectors", [])
+        industries = mapping.get("industries")
+        candidates = screen_undervalued_in_sectors(sectors, industries, st_cfg)
+        if candidates:
+            sector_candidates[trend.category] = candidates
+            logger.info(
+                "%s 섹터: %d개 저평가 종목 발굴",
+                trend.category, len(candidates),
+            )
+
+    # 4. AI 내러티브 생성
+    narrative = generate_ai_narrative(trends, sector_candidates, model=llm_model)
+
+    # 5. 리포트 생성 & Slack 전송
+    report = SectorTrendReport(
+        analysis_period_days=days,
+        trending_categories=[t for t, _ in promising] if promising else trends[:5],
+        sector_candidates=sector_candidates,
+        ai_narrative=narrative,
+    )
+
+    msg = format_sector_trend_report(report)
+    try:
+        slack = SlackSender()
+        slack.send_webhook_message(msg)
+        logger.info("=== Sector Trend Report sent to Slack ===")
+        return True
+    except Exception as e:
+        logger.error("Sector trend Slack send failed: %s", e)
+        return False
+
+
+def _check_sector_trend_schedule(config: dict, last_run_hours: dict[int, str]) -> bool:
+    """KST 기준으로 스케줄된 시간인지 확인. 중복 실행 방지."""
+    from datetime import timezone, timedelta
+
+    st_cfg = get_sector_trend_config(config)
+    if not st_cfg.get("enabled", False):
+        return False
+
+    schedule_hours = st_cfg.get("schedule_hours_kst", [10, 15])
+    kst = timezone(timedelta(hours=9))
+    now_kst = datetime.now(kst)
+    current_hour = now_kst.hour
+    today_str = now_kst.strftime("%Y-%m-%d")
+
+    if current_hour in schedule_hours:
+        run_key = f"{today_str}_{current_hour}"
+        if last_run_hours.get(current_hour) != run_key:
+            last_run_hours[current_hour] = run_key
+            return True
+
+    return False
+
+
 def main():
     load_dotenv()
     config = load_config()
@@ -485,6 +587,9 @@ def main():
     discovered_symbols = discover_new_stocks(config, watchlist)
     all_symbols = list(dict.fromkeys(watchlist + discovered_symbols))
     logger.info("Tracking %d symbols: %s", len(all_symbols), all_symbols)
+
+    # 섹터 트렌드 스케줄 추적
+    sector_trend_last_runs: dict[int, str] = {}
 
     while True:
         try:
@@ -517,7 +622,14 @@ def main():
                 except Exception as e:
                     logger.error("Slack send failed: %s", e)
 
-            # 5. 페이퍼 트레이딩 (활성화 시)
+            # 5. 섹터 트렌드 분석 (스케줄 체크)
+            if _check_sector_trend_schedule(config, sector_trend_last_runs):
+                try:
+                    run_sector_trend_pipeline(config, news_store)
+                except Exception as e:
+                    logger.error("Sector trend pipeline error: %s", e)
+
+            # 6. 페이퍼 트레이딩 (활성화 시)
             if config.get("paper_trading", {}).get("enabled"):
                 try:
                     from portfolio.paper_trader import PaperTrader
@@ -540,7 +652,18 @@ def main():
 if __name__ == "__main__":
     import sys
 
-    if "--backfill-categories" in sys.argv:
+    if "--sector-trend" in sys.argv:
+        load_dotenv()
+        config = load_config()
+        # 읽기 전용으로 열어서 다른 프로세스 lock 충돌 방지
+        news_store = _init_news_store(config, read_only=True)
+        if news_store is None:
+            logger.error("Database not enabled in config")
+            sys.exit(1)
+        success = run_sector_trend_pipeline(config, news_store)
+        news_store.close()
+        sys.exit(0 if success else 1)
+    elif "--backfill-categories" in sys.argv:
         load_dotenv()
         config = load_config()
         news_store = _init_news_store(config)

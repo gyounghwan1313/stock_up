@@ -67,15 +67,16 @@ def _interval(n: int, unit: str = "DAY") -> str:
 
 
 class NewsStore:
-    def __init__(self, db_path: str = "./data/news.duckdb"):
+    def __init__(self, db_path: str = "./data/news.duckdb", read_only: bool = False):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         self.db_path = db_path
+        self._read_only = read_only
         self._conn: Optional[duckdb.DuckDBPyConnection] = None
 
     @property
     def conn(self) -> duckdb.DuckDBPyConnection:
         if self._conn is None:
-            self._conn = duckdb.connect(self.db_path)
+            self._conn = duckdb.connect(self.db_path, read_only=self._read_only)
         return self._conn
 
     def init_schema(self) -> None:
@@ -336,6 +337,72 @@ class NewsStore:
                 categories=categories if categories else None,
             ))
         return records
+
+    def get_category_sentiment_summary(self, days: int = 7) -> list[dict]:
+        """카테고리별 감성 점수 집계 (N일간).
+
+        Returns:
+            list[dict] with keys:
+                category, avg_sentiment, news_count,
+                recent_avg (후반부 평균), older_avg (전반부 평균),
+                top_headlines: list[tuple[str, float]]
+        """
+        half = max(1, days // 2)
+
+        # 카테고리별 전체 평균/건수 + 전반/후반 평균
+        sql = f"""
+            SELECT
+                c.name AS category,
+                AVG(n.sentiment_score)   AS avg_sentiment,
+                COUNT(*)                 AS news_count,
+                AVG(CASE WHEN n.collected_at >= CURRENT_TIMESTAMP - {_interval(half)}
+                         THEN n.sentiment_score END) AS recent_avg,
+                AVG(CASE WHEN n.collected_at <  CURRENT_TIMESTAMP - {_interval(half)}
+                              AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+                         THEN n.sentiment_score END) AS older_avg
+            FROM news n
+            JOIN news_categories nc ON n.id = nc.news_id
+            JOIN categories c ON nc.category_id = c.id
+            WHERE n.sentiment_score IS NOT NULL
+              AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+            GROUP BY c.name
+            ORDER BY avg_sentiment DESC
+        """
+        rows = self.conn.execute(sql).fetchall()
+
+        results = []
+        for row in rows:
+            category = row[0]
+            avg_sent = row[1]
+            count = row[2]
+            recent_avg = row[3]
+            older_avg = row[4]
+
+            # 해당 카테고리의 감성점수 상위 헤드라인
+            hl_sql = f"""
+                SELECT n.title_translated, n.sentiment_score
+                FROM news n
+                JOIN news_categories nc ON n.id = nc.news_id
+                JOIN categories c ON nc.category_id = c.id
+                WHERE c.name = ?
+                  AND n.sentiment_score IS NOT NULL
+                  AND n.collected_at >= CURRENT_TIMESTAMP - {_interval(days)}
+                ORDER BY n.sentiment_score DESC
+                LIMIT 5
+            """
+            hl_rows = self.conn.execute(hl_sql, [category]).fetchall()
+            top_headlines = [(r[0], r[1]) for r in hl_rows]
+
+            results.append({
+                "category": category,
+                "avg_sentiment": float(avg_sent) if avg_sent is not None else 0.0,
+                "news_count": int(count),
+                "recent_avg": float(recent_avg) if recent_avg is not None else None,
+                "older_avg": float(older_avg) if older_avg is not None else None,
+                "top_headlines": top_headlines,
+            })
+
+        return results
 
     def get_uncategorized_news(self, limit: int = 500) -> list[NewsRecord]:
         """카테고리가 없는 뉴스 목록 조회"""

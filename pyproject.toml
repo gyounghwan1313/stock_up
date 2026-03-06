@@ -17,6 +17,7 @@ dependencies = [
     "lxml>=5.0.0",
     "duckdb>=1.0.0",
     "defusedxml>=0.7.1",
+    "dotenv>=0.9.9",
 ]
 
 [project.optional-dependencies]
