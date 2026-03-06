@@ -31,6 +31,9 @@ class YFinanceFundamentalProvider:
                     dividend_yield=info.get("dividendYield"),
                     sector=info.get("sector"),
                     industry=info.get("industry"),
+                    psr=info.get("priceToSalesTrailing12Months"),
+                    roe=info.get("returnOnEquity"),
+                    debt_to_equity=info.get("debtToEquity"),
                 )
             except Exception as e:
                 last_err = e

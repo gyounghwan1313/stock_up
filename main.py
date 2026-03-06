@@ -73,6 +73,26 @@ def _init_news_store(config: dict, read_only: bool = False):
         return None
 
 
+def _init_stock_store(config: dict, read_only: bool = False):
+    """DB 설정이 있으면 StockStore를 초기화, 없으면 None 반환"""
+    db_cfg = config.get("database", {})
+    if not db_cfg.get("enabled", False):
+        return None
+
+    try:
+        from storage.stock_store import StockStore
+
+        db_path = db_cfg.get("path", "./data/news.duckdb")
+        store = StockStore(db_path=db_path, read_only=read_only)
+        if not read_only:
+            store.init_schema()
+        logger.info("DuckDB stock store initialized: %s (read_only=%s)", db_path, read_only)
+        return store
+    except Exception as e:
+        logger.warning("Stock store initialization failed, continuing without it: %s", e)
+        return None
+
+
 def run_news_pipeline(
     config: dict,
     dup_checker: DuplicateChecker,
@@ -310,6 +330,7 @@ def run_stock_pipeline(
     symbols: list[str],
     headlines: list[str],
     news_store=None,
+    stock_store=None,
 ) -> list:
     """주식 분석 + 추천 파이프라인 (과거 뉴스 데이터 활용)"""
     price_provider = YFinancePriceProvider()
@@ -357,6 +378,19 @@ def run_stock_pipeline(
             signal = recommender.recommend(quote, indicators, fundamentals, sentiment_score)
             signals.append(signal)
             logger.info("%s: %s (confidence=%.0f%%)", symbol, signal.signal_type.value, signal.confidence * 100)
+
+            # 스냅샷 저장 (추가 API 호출 없이 기존 데이터 재활용)
+            if stock_store is not None:
+                try:
+                    stock_store.save_snapshot(
+                        symbol=symbol,
+                        date=quote.timestamp,
+                        quote=quote,
+                        indicators=indicators,
+                        fundamentals=fundamentals,
+                    )
+                except Exception as e:
+                    logger.warning("Snapshot save failed for %s: %s", symbol, e)
         except Exception as e:
             logger.error("Analysis failed for %s: %s", symbol, e)
 
@@ -581,6 +615,7 @@ def main():
 
     # DB 초기화
     news_store = _init_news_store(config)
+    stock_store = _init_stock_store(config)
 
     # 종목 탐색은 첫 실행 시 한 번만
     watchlist = get_watchlist(config)
@@ -604,7 +639,7 @@ def main():
                 run_news_evaluation(config, symbol_news_map, dup_checker)
 
             # 3. 주식 분석 파이프라인 (과거 뉴스 DB 활용)
-            signals = run_stock_pipeline(config, all_symbols, headlines, news_store)
+            signals = run_stock_pipeline(config, all_symbols, headlines, news_store, stock_store)
 
             # 4. 시그널 Slack 전송 (HOLD 제외, 중복 제외)
             for signal in signals:
