@@ -15,4 +15,5 @@ class NewsRecord:
     related_symbols: Optional[list[str]] = None
     categories: Optional[list[str]] = None
     embedding: Optional[list[float]] = None
+    group_id: Optional[str] = None
     id: Optional[int] = None

@@ -33,6 +33,18 @@ CREATE INDEX IF NOT EXISTS idx_news_source ON news(source);
 CREATE INDEX IF NOT EXISTS idx_news_published_at ON news(published_at);
 """
 
+NEWS_GROUPS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS news_groups (
+    group_id    VARCHAR PRIMARY KEY,
+    summary     TEXT NOT NULL,
+    category    VARCHAR,
+    importance  SMALLINT,
+    reason      TEXT,
+    symbols     VARCHAR[],
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
 CATEGORIES_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS categories (
     id   INTEGER PRIMARY KEY DEFAULT nextval('categories_id_seq'),
@@ -53,7 +65,7 @@ LEFT JOIN news_categories nc ON n.id = nc.news_id
 LEFT JOIN categories c ON nc.category_id = c.id
 GROUP BY n.id, n.title_original, n.title_translated, n.source, n.link,
          n.published_at, n.collected_at, n.sentiment_score, n.related_symbols, n.title_hash,
-         n.embedding;
+         n.embedding, n.group_id;
 """
 
 
@@ -83,8 +95,10 @@ class NewsStore:
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS news_id_seq START 1")
         self.conn.execute(SCHEMA_SQL)
         self.conn.execute(INDEX_SQL)
-        # 기존 DB 마이그레이션: embedding 컬럼 추가 (VIEW 생성 전에 실행)
+        # 기존 DB 마이그레이션: embedding, group_id 컬럼 추가 (VIEW 생성 전에 실행)
         self.conn.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS embedding FLOAT[]")
+        self.conn.execute("ALTER TABLE news ADD COLUMN IF NOT EXISTS group_id VARCHAR")
+        self.conn.execute(NEWS_GROUPS_SCHEMA_SQL)
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS categories_id_seq START 1")
         self.conn.execute(CATEGORIES_SCHEMA_SQL)
         # 시드 데이터 삽입
@@ -108,8 +122,8 @@ class NewsStore:
             """
             INSERT INTO news (title_original, title_translated, source, link,
                               published_at, collected_at, sentiment_score,
-                              related_symbols, title_hash, embedding)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              related_symbols, title_hash, embedding, group_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             [
@@ -123,6 +137,7 @@ class NewsStore:
                 record.related_symbols,
                 title_hash,
                 record.embedding,
+                record.group_id,
             ],
         ).fetchone()
 
@@ -146,6 +161,25 @@ class NewsStore:
             raise
         logger.info("Saved %d/%d news records", saved, len(records))
         return saved
+
+    def save_news_group(
+        self,
+        group_id: str,
+        summary: str,
+        category: str | None = None,
+        importance: int | None = None,
+        reason: str | None = None,
+        symbols: list[str] | None = None,
+    ) -> None:
+        """news_groups 테이블에 그룹 정보를 저장 (ON CONFLICT 무시)."""
+        self.conn.execute(
+            """
+            INSERT INTO news_groups (group_id, summary, category, importance, reason, symbols)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (group_id) DO NOTHING
+            """,
+            [group_id, summary, category, importance, reason, symbols],
+        )
 
     def search_by_keyword(self, keyword: str, days: int = 30, limit: int = 50) -> list[NewsRecord]:
         sql = f"""

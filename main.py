@@ -98,12 +98,13 @@ def run_news_pipeline(
     dup_checker: DuplicateChecker,
     news_store=None,
     watchlist: list[str] | None = None,
+    world_context_provider=None,
 ) -> tuple[list[str], dict[str, list[NewsAlertItem]]]:
-    """RSS 뉴스 크롤링 → 번역 → 감성점수 계산 → DB 저장 + 파일 저장 파이프라인.
+    """RSS 뉴스 크롤링 → 큐레이션 → 감성점수 → DB 저장 파이프라인.
 
     2단계 구조:
       Phase 1 - 각 소스에서 수집 + 중복 제거
-      Phase 2 - 전체 신규 건을 통합 배치로 번역/감성분석/저장
+      Phase 2 - LLM 큐레이션(그룹핑+번역+중요도) → 감성분석 → 저장
 
     Returns:
         (all_headlines, symbol_news_map) 튜플
@@ -119,7 +120,6 @@ def run_news_pipeline(
         sentiment_analyzer = SentimentAnalyzer(model=sentiment_cfg.get("model", "gpt-4o-mini"))
 
     # ── Phase 1: 각 소스에서 수집 + 중복 제거 ──
-    # 수집 결과를 중간 구조로 모은다
     collected: list[dict] = []  # {source, news_item, cleaned_title, file_path}
 
     for news_cfg in news_configs:
@@ -148,7 +148,6 @@ def run_news_pipeline(
             if not dup_result["new"]:
                 continue
 
-            # 신규 건만 필터링
             for item, title in zip(items_with_title, titles):
                 if title in new_orig_set:
                     collected.append({
@@ -182,11 +181,64 @@ def run_news_pipeline(
     logger.info("Phase 2: processing %d new items from %d sources",
                 len(all_new_titles), len({c["source"] for c in collected}))
 
-    # 2-1. 번역 + 카테고리 태깅 (GPT 배치 1회)
-    translator = GPTTranslator()
-    all_translated, all_categories = translator.translate_and_categorize_titles(all_new_titles)
-    trans_map = dict(zip(all_new_titles, all_translated))
-    cat_map = dict(zip(all_new_titles, all_categories))
+    # 2-1. LLM 큐레이션 (그룹핑 + 번역 + 카테고리 + 중요도)
+    curator_cfg = config.get("news_curator", {})
+    world_ctx = ""
+    if world_context_provider:
+        world_ctx = world_context_provider.get_context()
+
+    if curator_cfg.get("enabled"):
+        from engine.news_curator import NewsCurator
+
+        curator = NewsCurator(
+            model=curator_cfg.get("model", "gpt-4o-mini"),
+            importance_threshold=curator_cfg.get("importance_threshold", 6),
+            batch_size=curator_cfg.get("batch_size", 30),
+        )
+        curated_groups = curator.curate(all_new_titles, world_ctx)
+    else:
+        # 큐레이터 비활성 시 기존 방식 fallback (개별 번역)
+        from engine.news_curator import CuratedGroup
+        import uuid
+
+        translator = GPTTranslator()
+        all_translated, all_categories, all_symbols = translator.translate_and_categorize_titles(all_new_titles)
+        curated_groups = []
+        for i, title in enumerate(all_new_titles):
+            curated_groups.append(CuratedGroup(
+                group_id=str(uuid.uuid4())[:8],
+                headline_indices=[i],
+                summary=all_translated[i],
+                category=all_categories[i][0] if all_categories[i] else "기타",
+                importance=5,
+                reason="curator disabled",
+                symbols=all_symbols[i] if i < len(all_symbols) else [],
+            ))
+
+    # 큐레이션 결과를 개별 헤드라인에 매핑
+    # title → (translated_summary, category, group_id, importance, symbols)
+    trans_map: dict[str, str] = {}
+    cat_map: dict[str, list[str]] = {}
+    group_map: dict[str, str] = {}  # title → group_id
+    importance_map: dict[str, int] = {}  # title → importance
+    importance_threshold = curator_cfg.get("importance_threshold", 6)
+
+    for g in curated_groups:
+        for idx in g.headline_indices:
+            if idx < len(all_new_titles):
+                title = all_new_titles[idx]
+                trans_map[title] = g.summary
+                cat_map[title] = [g.category]
+                group_map[title] = g.group_id
+                importance_map[title] = g.importance
+
+    logger.info(
+        "Curation: %d groups from %d headlines, %d important (threshold=%d)",
+        len(curated_groups),
+        len(all_new_titles),
+        sum(1 for g in curated_groups if g.importance >= importance_threshold),
+        importance_threshold,
+    )
 
     # 2-2. 감성점수 배치 계산
     if sentiment_analyzer:
@@ -202,28 +254,48 @@ def run_news_pipeline(
             title = c["cleaned_title"]
             save_file(file_path=c["file_path"], title=trans_map.get(title, title))
 
-    # 2-4. Slack 발송
+    # 2-4. Slack 발송 (중요 그룹만, 그룹 요약으로 표시)
     news_channel = os.getenv("SLACK_CHANNEL_NEWS")
     if news_channel:
         try:
             slack = SlackSender()
             lines = []
-            for title in all_new_titles:
-                translated = trans_map.get(title, title)
-                cats = cat_map.get(title, [])
-                tag = " ".join(f"[{c}]" for c in cats) if cats else ""
-                lines.append(f"• {tag} {translated}" if tag else f"• {translated}")
-            msg = "\n".join(lines)
-            slack.send_bot_message(channel=news_channel, message=msg)
+            seen_groups: set[str] = set()
+            for g in curated_groups:
+                if g.importance < importance_threshold:
+                    continue
+                if g.group_id in seen_groups:
+                    continue
+                seen_groups.add(g.group_id)
+                lines.append(f"• [{g.importance}/10] [{g.category}] {g.summary}")
+            if lines:
+                msg = "\n".join(lines)
+                slack.send_bot_message(channel=news_channel, message=msg)
+            else:
+                logger.info("No important headlines to send to Slack")
         except Exception as e:
             logger.error("News channel Slack send failed: %s", e)
 
-    # 2-5. DB 저장 (소스별로 묶어서 저장)
+    # 2-5. DB 저장 (모든 뉴스 + 그룹 정보)
     if news_store is not None:
-        # 소스별로 그룹핑
         from itertools import groupby
         from operator import itemgetter
 
+        # 그룹 정보 저장
+        seen_groups_db: set[str] = set()
+        for g in curated_groups:
+            if g.group_id not in seen_groups_db:
+                seen_groups_db.add(g.group_id)
+                news_store.save_news_group(
+                    group_id=g.group_id,
+                    summary=g.summary,
+                    category=g.category,
+                    importance=g.importance,
+                    reason=g.reason,
+                    symbols=g.symbols if g.symbols else None,
+                )
+
+        # 개별 뉴스 저장 (소스별)
         for source, group in groupby(collected, key=itemgetter("source")):
             items_in_source = list(group)
             src_news_items = [c["news_item"] for c in items_in_source]
@@ -232,17 +304,30 @@ def run_news_pipeline(
             src_scores = [score_map.get(t) for t in src_titles]
             src_categories = [cat_map.get(t, []) for t in src_titles]
             src_embeddings = [embed_map.get(t) for t in src_titles]
+            src_group_ids = [group_map.get(t) for t in src_titles]
             _save_news_to_db(
                 news_store, src_news_items, src_titles, src_translated,
                 source, watchlist, src_scores, src_categories, src_embeddings,
+                src_group_ids,
             )
     else:
         from storage.symbol_extractor import extract_symbols
         for title in all_new_titles:
             extract_symbols(title, watchlist)
 
-    # 2-6. symbol_news_map 구축
+    # 2-6. symbol_news_map 구축 (큐레이터가 추출한 심볼 + 기존 추출)
     from storage.symbol_extractor import extract_symbols
+
+    for g in curated_groups:
+        for sym in g.symbols:
+            for idx in g.headline_indices:
+                if idx < len(all_new_titles):
+                    title = all_new_titles[idx]
+                    score = score_map.get(title)
+                    if score is not None:
+                        symbol_news_map.setdefault(sym, []).append(
+                            NewsAlertItem(title=title, sentiment_score=score)
+                        )
 
     for title in all_new_titles:
         score = score_map.get(title)
@@ -262,8 +347,9 @@ def _save_news_to_db(
     sentiment_scores: list[float | None] | None = None,
     categories_list: list[list[str]] | None = None,
     embeddings: list[list[float] | None] | None = None,
+    group_ids: list[str | None] | None = None,
 ) -> set[str]:
-    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리도 즉시 포함.
+    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리 + 그룹 ID도 즉시 포함.
 
     Returns:
         관련 종목 심볼 집합
@@ -291,6 +377,7 @@ def _save_news_to_db(
         score = sentiment_scores[i] if sentiment_scores and i < len(sentiment_scores) else None
         cats = categories_list[i] if categories_list and i < len(categories_list) else None
         emb = embeddings[i] if embeddings and i < len(embeddings) else None
+        gid = group_ids[i] if group_ids and i < len(group_ids) else None
 
         records.append(NewsRecord(
             title_original=original,
@@ -303,6 +390,7 @@ def _save_news_to_db(
             related_symbols=related if related else None,
             categories=cats,
             embedding=emb,
+            group_id=gid,
         ))
 
     news_store.save_news_batch(records)
@@ -617,6 +705,16 @@ def main():
     news_store = _init_news_store(config)
     stock_store = _init_stock_store(config)
 
+    # 월드 컨텍스트 초기화 (하루 1회 갱신, 인메모리 캐시)
+    world_context_provider = None
+    world_ctx_cfg = config.get("world_context", {})
+    if world_ctx_cfg.get("enabled"):
+        from engine.world_context import WorldContextProvider
+        world_context_provider = WorldContextProvider(
+            model=world_ctx_cfg.get("model", "gpt-4o-mini"),
+            cache_hours=world_ctx_cfg.get("cache_hours", 24),
+        )
+
     # 종목 탐색은 첫 실행 시 한 번만
     watchlist = get_watchlist(config)
     discovered_symbols = discover_new_stocks(config, watchlist)
@@ -631,8 +729,10 @@ def main():
             # Docker 재시작 등으로 인한 429 방지: 마지막 실행 이후 남은 대기 시간만큼 대기
             rate_limiter.wait_if_needed("news_pipeline", poll_interval)
 
-            # 1. 뉴스 파이프라인 (감성점수 즉시 계산 + DB 저장)
-            headlines, symbol_news_map = run_news_pipeline(config, dup_checker, news_store, all_symbols)
+            # 1. 뉴스 파이프라인 (큐레이션 + 감성점수 + DB 저장)
+            headlines, symbol_news_map = run_news_pipeline(
+                config, dup_checker, news_store, all_symbols, world_context_provider
+            )
 
             # 2. 뉴스 트리거 기반 즉시 분석 & 알림
             if symbol_news_map:

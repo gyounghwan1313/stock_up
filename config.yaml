@@ -112,9 +112,22 @@ sector_trend:
     min_market_cap: 5_000_000_000  # 시가총액 하한 (50억 달러)
   llm_model: "gpt-4o-mini"        # AI 내러티브 생성 모델
 
+# 뉴스 큐레이션 설정 (LLM 기반 그룹핑 + 중요도 평가)
+news_curator:
+  enabled: true
+  model: "gpt-4o-mini"        # 큐레이션에 사용할 LLM 모델
+  importance_threshold: 6     # 1-10 스케일, 이상만 Slack 발송
+  batch_size: 30              # 1회 API 호출당 최대 헤드라인 수
+
+# 월드 컨텍스트 설정 (세계 정세 브리핑)
+world_context:
+  enabled: true
+  model: "gpt-4o-mini"
+  cache_hours: 24             # 갱신 주기 (시간)
+
 # 유사 뉴스 중복 제거 설정
 news_dedup:
-  similarity_threshold: 0.85  # 코사인 유사도 임계값 (0.0~1.0, 높을수록 엄격 / embedding 기준)
+  similarity_threshold: 0.75  # 코사인 유사도 임계값 (0.0~1.0, 높을수록 엄격 / embedding 기준)
 
 # 전체 시스템 폴링 주기 (300초 = 5분)
 poll_interval_seconds: 300
