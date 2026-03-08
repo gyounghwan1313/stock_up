@@ -1,61 +1,46 @@
+"""뉴스 헤드라인에서 관련 주식 심볼을 추출하는 유틸리티."""
+
 import re
 
-COMPANY_ALIASES: dict[str, str] = {
-    "apple": "AAPL",
-    "microsoft": "MSFT",
-    "google": "GOOGL",
-    "alphabet": "GOOGL",
-    "amazon": "AMZN",
-    "tesla": "TSLA",
-    "nvidia": "NVDA",
-    "meta": "META",
-    "netflix": "NFLX",
-    "amd": "AMD",
-    "intel": "INTC",
-    "boeing": "BA",
-    "jpmorgan": "JPM",
-    "goldman sachs": "GS",
-    "goldman": "GS",
-    "berkshire": "BRK-B",
+# 자주 등장하는 기업명 → 티커 매핑
+_COMPANY_TICKER_MAP = {
+    "apple": "AAPL", "microsoft": "MSFT", "google": "GOOGL", "alphabet": "GOOGL",
+    "amazon": "AMZN", "tesla": "TSLA", "nvidia": "NVDA", "meta": "META",
+    "facebook": "META", "jpmorgan": "JPM", "goldman sachs": "GS", "goldman": "GS",
+    "wells fargo": "WFC", "bank of america": "BAC", "morgan stanley": "MS",
+    "disney": "DIS", "intel": "INTC", "amd": "AMD", "netflix": "NFLX",
+    "coreweave": "CRWV", "rimini street": "RMNI",
 }
 
-# 대문자 1~5자 (주식 심볼 패턴)
-TICKER_PATTERN = re.compile(r'\b([A-Z]{1,5})\b')
-
-# 너무 흔한 단어 제외
-COMMON_WORDS = {
-    "THE", "AND", "FOR", "ARE", "BUT", "NOT", "YOU", "ALL",
-    "CAN", "HER", "WAS", "ONE", "OUR", "OUT", "HAS", "HIS",
-    "HOW", "MAN", "NEW", "NOW", "OLD", "SEE", "WAY", "WHO",
-    "BOY", "DID", "GET", "HIM", "LET", "SAY", "SHE", "TOO",
-    "USE", "DAD", "MOM", "ITS", "GDP", "CPI", "FED", "USD",
-    "EUR", "GBP", "JPY", "OIL", "IMF", "PMI", "API", "ETF",
-    "IPO", "CEO", "CFO", "NYSE", "SEC", "DOJ", "FBI", "CIA",
-    "NATO", "OPEC", "WHO", "WTO", "ECB", "BOE", "BOJ",
-    "RSS", "URL", "USA", "UK",
-}
+# 괄호 안의 티커 패턴 (e.g., "(AAPL)", "(DK)")
+_TICKER_PATTERN = re.compile(r"\(([A-Z]{1,5})\)")
 
 
-def extract_symbols(text: str, watchlist: list[str] | None = None) -> list[str]:
+def extract_symbols(title: str, watchlist: list[str] | None = None) -> list[str]:
+    """헤드라인에서 관련 종목 심볼을 추출.
+
+    1. 괄호 안의 티커 심볼 추출 (e.g., "Delek US Holdings (DK)")
+    2. 워치리스트에 있는 심볼이 제목에 언급되면 추출
+    3. 알려진 기업명 매핑
+    """
     symbols: set[str] = set()
+    title_upper = title.upper()
 
-    # 1. 회사명 매칭
-    text_lower = text.lower()
-    for alias, symbol in COMPANY_ALIASES.items():
-        if alias in text_lower:
-            symbols.add(symbol)
+    # 1. 괄호 안 티커
+    for match in _TICKER_PATTERN.finditer(title):
+        symbols.add(match.group(1))
 
-    # 2. 워치리스트 심볼 직접 매칭
+    # 2. 워치리스트 심볼 매칭
     if watchlist:
         for sym in watchlist:
-            if sym.upper() in text.upper():
-                symbols.add(sym.upper())
+            # 단어 경계로 매칭 (e.g., "AAPL" in "AAPL earnings")
+            if re.search(rf"\b{re.escape(sym)}\b", title_upper):
+                symbols.add(sym)
 
-    # 3. 대문자 패턴 매칭 (보수적으로)
-    for match in TICKER_PATTERN.finditer(text):
-        candidate = match.group(1)
-        if candidate not in COMMON_WORDS and len(candidate) >= 2:
-            if watchlist and candidate in [w.upper() for w in watchlist]:
-                symbols.add(candidate)
+    # 3. 기업명 매핑
+    title_lower = title.lower()
+    for company, ticker in _COMPANY_TICKER_MAP.items():
+        if company in title_lower:
+            symbols.add(ticker)
 
     return sorted(symbols)
