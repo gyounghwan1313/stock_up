@@ -1,7 +1,6 @@
 import logging
 import os
-from datetime import datetime
-from time import sleep
+import sys
 
 import yfinance as yf
 from dotenv import load_dotenv
@@ -12,685 +11,26 @@ _tz_cache_dir = os.path.join(_shm, f"yfinance_tz_cache_{os.getpid()}")
 os.makedirs(_tz_cache_dir, exist_ok=True)
 yf.set_tz_cache_location(_tz_cache_dir)
 
-from core.models import NewsAlertItem, SignalType
-from crawler.rss_fetcher import RSSFetcher
-from crawler.rss_parser import RSSParser
-from engine.news_evaluator import NewsEvaluator
-from engine.recommender import Recommender
-from engine.sentiment import SentimentAnalyzer
-from indicators.technical import calculate_indicators
-from providers.fundamental.yfinance_fundamental import YFinanceFundamentalProvider
-from providers.news.rate_limiter import RateLimiter
-from providers.news.rss_provider import RSSNewsProvider
-from providers.price.yfinance_provider import YFinancePriceProvider
-from screener.stock_screener import StockScreener
-from sender.formatters import (
-    format_discovery_message,
-    format_news_alert_message,
-    format_signal_message,
-)
-from sender.slack_sender import SlackSender
-from sender.translator import GPTTranslator
-from utils.config_loader import (
-    get_discovery_config,
-    get_sector_trend_config,
-    get_watchlist,
-    is_discovery_enabled,
-    load_config,
-)
-from utils.dup_check import DuplicateChecker, deduplicate_similar
-from utils.file_ctrl import save_file
+from shared.config import get_watchlist, load_config
+from shared.db import init_news_store, init_stock_store
+from shared.models import SignalType
+from shared.slack import SlackSender
 
-# 소스별 타이틀 prefix 매핑
-_SOURCE_PREFIXES = {"financialjuice": "FinancialJuice:"}
+from news.dedup import DuplicateChecker
+from news.pipeline import backfill_categories, run_news_pipeline
+from news.rate_limiter import RateLimiter
+
+from alerts.pipeline import run_news_evaluation
+from analysis.formatter import format_signal_message
+from analysis.pipeline import run_stock_pipeline
+from discovery.pipeline import discover_new_stocks
 
 _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
 logging.basicConfig(level=_log_level, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-# 써드파티 라이브러리는 DEBUG 모드에서도 WARNING 이상만 출력
 for _noisy_logger in ("yfinance", "httpx", "urllib3", "requests", "peewee"):
     logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
-
-def _init_news_store(config: dict, read_only: bool = False):
-    """DB 설정이 있으면 NewsStore를 초기화, 없으면 None 반환"""
-    db_cfg = config.get("database", {})
-    if not db_cfg.get("enabled", False):
-        return None
-
-    try:
-        from storage.news_store import NewsStore
-
-        db_path = db_cfg.get("path", "./data/news.duckdb")
-        store = NewsStore(db_path=db_path, read_only=read_only)
-        if not read_only:
-            store.init_schema()
-        logger.info("DuckDB news store initialized: %s (read_only=%s)", db_path, read_only)
-        return store
-    except Exception as e:
-        logger.warning("DB initialization failed, continuing without DB: %s", e)
-        return None
-
-
-def _init_stock_store(config: dict, read_only: bool = False):
-    """DB 설정이 있으면 StockStore를 초기화, 없으면 None 반환"""
-    db_cfg = config.get("database", {})
-    if not db_cfg.get("enabled", False):
-        return None
-
-    try:
-        from storage.stock_store import StockStore
-
-        db_path = db_cfg.get("path", "./data/news.duckdb")
-        store = StockStore(db_path=db_path, read_only=read_only)
-        if not read_only:
-            store.init_schema()
-        logger.info("DuckDB stock store initialized: %s (read_only=%s)", db_path, read_only)
-        return store
-    except Exception as e:
-        logger.warning("Stock store initialization failed, continuing without it: %s", e)
-        return None
-
-
-def run_news_pipeline(
-    config: dict,
-    dup_checker: DuplicateChecker,
-    news_store=None,
-    watchlist: list[str] | None = None,
-    world_context_provider=None,
-) -> tuple[list[str], dict[str, list[NewsAlertItem]]]:
-    """RSS 뉴스 크롤링 → 큐레이션 → 감성점수 → DB 저장 파이프라인.
-
-    2단계 구조:
-      Phase 1 - 각 소스에서 수집 + 중복 제거
-      Phase 2 - LLM 큐레이션(그룹핑+번역+중요도) → 감성분석 → 저장
-
-    Returns:
-        (all_headlines, symbol_news_map) 튜플
-        symbol_news_map: {symbol: [NewsAlertItem, ...]} — 관련 종목별 뉴스+감성
-    """
-    news_configs = config.get("providers", {}).get("news", [])
-    all_headlines: list[str] = []
-    symbol_news_map: dict[str, list[NewsAlertItem]] = {}
-
-    sentiment_cfg = config.get("sentiment", {})
-    sentiment_analyzer = None
-    if sentiment_cfg.get("enabled"):
-        sentiment_analyzer = SentimentAnalyzer(model=sentiment_cfg.get("model", "gpt-4o-mini"))
-
-    # ── Phase 1: 각 소스에서 수집 + 중복 제거 ──
-    collected: list[dict] = []  # {source, news_item, cleaned_title, file_path}
-
-    for news_cfg in news_configs:
-        url = news_cfg.get("url")
-        source = news_cfg.get("source", "unknown")
-        if not url:
-            continue
-
-        try:
-            provider = RSSNewsProvider(url)
-            news_items = provider.fetch_news()
-            items_with_title = [item for item in news_items if item.get("title")]
-
-            prefix = _SOURCE_PREFIXES.get(source, "")
-            titles = [item["title"].removeprefix(prefix).strip() for item in items_with_title]
-            all_headlines.extend(titles)
-
-            # 원문 기준 중복 체크
-            dup_result = dup_checker.check(titles)
-            new_orig_set = set(dup_result["new"].keys())
-            logger.info(
-                "[%s] %d new, %d duplicate",
-                source, len(dup_result["new"]), len(dup_result["duplicate"]),
-            )
-
-            if not dup_result["new"]:
-                continue
-
-            for item, title in zip(items_with_title, titles):
-                if title in new_orig_set:
-                    collected.append({
-                        "source": source,
-                        "news_item": item,
-                        "cleaned_title": title,
-                        "file_path": dup_result["new"].get(title),
-                    })
-
-        except Exception as e:
-            logger.error("[%s] News fetch error: %s", source, e)
-
-    if not collected:
-        return all_headlines, symbol_news_map
-
-    # ── Phase 1.5: 유사 뉴스 중복 제거 ──
-    dedup_cfg = config.get("news_dedup", {})
-    similarity_threshold = dedup_cfg.get("similarity_threshold", 0.65)
-    collected = deduplicate_similar(collected, threshold=similarity_threshold)
-
-    if not collected:
-        return all_headlines, symbol_news_map
-
-    # ── Phase 2: 통합 배치 처리 ──
-    embed_map: dict[str, list[float]] = {
-        c["cleaned_title"]: c["embedding"]
-        for c in collected
-        if c.get("embedding") is not None
-    }
-    all_new_titles = [c["cleaned_title"] for c in collected]
-    logger.info("Phase 2: processing %d new items from %d sources",
-                len(all_new_titles), len({c["source"] for c in collected}))
-
-    # 2-1. LLM 큐레이션 (그룹핑 + 번역 + 카테고리 + 중요도)
-    curator_cfg = config.get("news_curator", {})
-    world_ctx = ""
-    if world_context_provider:
-        world_ctx = world_context_provider.get_context()
-
-    if curator_cfg.get("enabled"):
-        from engine.news_curator import NewsCurator
-
-        curator = NewsCurator(
-            model=curator_cfg.get("model", "gpt-4o-mini"),
-            importance_threshold=curator_cfg.get("importance_threshold", 6),
-            batch_size=curator_cfg.get("batch_size", 30),
-        )
-        curated_groups = curator.curate(all_new_titles, world_ctx)
-    else:
-        # 큐레이터 비활성 시 기존 방식 fallback (개별 번역)
-        from engine.news_curator import CuratedGroup
-        import uuid
-
-        translator = GPTTranslator()
-        all_translated, all_categories, all_symbols = translator.translate_and_categorize_titles(all_new_titles)
-        curated_groups = []
-        for i, title in enumerate(all_new_titles):
-            curated_groups.append(CuratedGroup(
-                group_id=str(uuid.uuid4())[:8],
-                headline_indices=[i],
-                summary=all_translated[i],
-                category=all_categories[i][0] if all_categories[i] else "기타",
-                importance=5,
-                reason="curator disabled",
-                symbols=all_symbols[i] if i < len(all_symbols) else [],
-            ))
-
-    # 큐레이션 결과를 개별 헤드라인에 매핑
-    # title → (translated_summary, category, group_id, importance, symbols)
-    trans_map: dict[str, str] = {}
-    cat_map: dict[str, list[str]] = {}
-    group_map: dict[str, str] = {}  # title → group_id
-    importance_map: dict[str, int] = {}  # title → importance
-    importance_threshold = curator_cfg.get("importance_threshold", 6)
-
-    for g in curated_groups:
-        for idx in g.headline_indices:
-            if idx < len(all_new_titles):
-                title = all_new_titles[idx]
-                trans_map[title] = g.summary
-                cat_map[title] = [g.category]
-                group_map[title] = g.group_id
-                importance_map[title] = g.importance
-
-    logger.info(
-        "Curation: %d groups from %d headlines, %d important (threshold=%d)",
-        len(curated_groups),
-        len(all_new_titles),
-        sum(1 for g in curated_groups if g.importance >= importance_threshold),
-        importance_threshold,
-    )
-
-    # 2-2. 감성점수 배치 계산
-    if sentiment_analyzer:
-        raw_scores = sentiment_analyzer.analyze_batch(all_new_titles)
-        all_scores: list[float | None] = list(raw_scores)
-    else:
-        all_scores = [None] * len(all_new_titles)
-    score_map = dict(zip(all_new_titles, all_scores))
-
-    # 2-3. 파일 저장
-    for c in collected:
-        if c["file_path"]:
-            title = c["cleaned_title"]
-            save_file(file_path=c["file_path"], title=trans_map.get(title, title))
-
-    # 2-4. Slack 발송 (중요 그룹만, 그룹 요약으로 표시)
-    news_channel = os.getenv("SLACK_CHANNEL_NEWS")
-    if news_channel:
-        try:
-            slack = SlackSender()
-            lines = []
-            seen_groups: set[str] = set()
-            for g in curated_groups:
-                if g.importance < importance_threshold:
-                    continue
-                if g.group_id in seen_groups:
-                    continue
-                seen_groups.add(g.group_id)
-                lines.append(f"• [{g.importance}/10] [{g.category}] {g.summary}")
-            if lines:
-                msg = "\n".join(lines)
-                slack.send_bot_message(channel=news_channel, message=msg)
-            else:
-                logger.info("No important headlines to send to Slack")
-        except Exception as e:
-            logger.error("News channel Slack send failed: %s", e)
-
-    # 2-5. DB 저장 (모든 뉴스 + 그룹 정보)
-    if news_store is not None:
-        from itertools import groupby
-        from operator import itemgetter
-
-        # 그룹 정보 저장
-        seen_groups_db: set[str] = set()
-        for g in curated_groups:
-            if g.group_id not in seen_groups_db:
-                seen_groups_db.add(g.group_id)
-                news_store.save_news_group(
-                    group_id=g.group_id,
-                    summary=g.summary,
-                    category=g.category,
-                    importance=g.importance,
-                    reason=g.reason,
-                    symbols=g.symbols if g.symbols else None,
-                )
-
-        # 개별 뉴스 저장 (소스별)
-        for source, group in groupby(collected, key=itemgetter("source")):
-            items_in_source = list(group)
-            src_news_items = [c["news_item"] for c in items_in_source]
-            src_titles = [c["cleaned_title"] for c in items_in_source]
-            src_translated = [trans_map.get(t, t) for t in src_titles]
-            src_scores = [score_map.get(t) for t in src_titles]
-            src_categories = [cat_map.get(t, []) for t in src_titles]
-            src_embeddings = [embed_map.get(t) for t in src_titles]
-            src_group_ids = [group_map.get(t) for t in src_titles]
-            _save_news_to_db(
-                news_store, src_news_items, src_titles, src_translated,
-                source, watchlist, src_scores, src_categories, src_embeddings,
-                src_group_ids,
-            )
-    else:
-        from storage.symbol_extractor import extract_symbols
-        for title in all_new_titles:
-            extract_symbols(title, watchlist)
-
-    # 2-6. symbol_news_map 구축 (큐레이터가 추출한 심볼 + 기존 추출)
-    from storage.symbol_extractor import extract_symbols
-
-    for g in curated_groups:
-        for sym in g.symbols:
-            for idx in g.headline_indices:
-                if idx < len(all_new_titles):
-                    title = all_new_titles[idx]
-                    score = score_map.get(title)
-                    if score is not None:
-                        symbol_news_map.setdefault(sym, []).append(
-                            NewsAlertItem(title=title, sentiment_score=score)
-                        )
-
-    for title in all_new_titles:
-        score = score_map.get(title)
-        if score is None:
-            continue
-        related = extract_symbols(title, watchlist)
-        for sym in related:
-            symbol_news_map.setdefault(sym, []).append(
-                NewsAlertItem(title=title, sentiment_score=score)
-            )
-
-    return all_headlines, symbol_news_map
-
-
-def _save_news_to_db(
-    news_store, news_items, titles, translated, source, watchlist,
-    sentiment_scores: list[float | None] | None = None,
-    categories_list: list[list[str]] | None = None,
-    embeddings: list[list[float] | None] | None = None,
-    group_ids: list[str | None] | None = None,
-) -> set[str]:
-    """수집한 뉴스를 DB에 저장. 감성점수 + 카테고리 + 그룹 ID도 즉시 포함.
-
-    Returns:
-        관련 종목 심볼 집합
-    """
-    from storage.models import NewsRecord
-    from storage.symbol_extractor import extract_symbols
-
-    records = []
-    all_symbols: set[str] = set()
-    for i, item in enumerate(news_items):
-        original = titles[i] if i < len(titles) else item.get("title", "")
-        trans = translated[i] if i < len(translated) else original
-
-        # 뉴스에서 관련 종목 자동 추출
-        related = extract_symbols(original, watchlist)
-        all_symbols.update(related)
-
-        pub_date = None
-        if item.get("pub_date"):
-            try:
-                pub_date = datetime.fromisoformat(item["pub_date"])
-            except (ValueError, TypeError):
-                pass
-
-        score = sentiment_scores[i] if sentiment_scores and i < len(sentiment_scores) else None
-        cats = categories_list[i] if categories_list and i < len(categories_list) else None
-        emb = embeddings[i] if embeddings and i < len(embeddings) else None
-        gid = group_ids[i] if group_ids and i < len(group_ids) else None
-
-        records.append(NewsRecord(
-            title_original=original,
-            title_translated=trans,
-            source=source,
-            link=item.get("link", ""),
-            published_at=pub_date,
-            collected_at=datetime.now(),
-            sentiment_score=score,
-            related_symbols=related if related else None,
-            categories=cats,
-            embedding=emb,
-            group_id=gid,
-        ))
-
-    news_store.save_news_batch(records)
-    return all_symbols
-
-
-def _get_historical_headlines(news_store, symbol: str, days: int = 7) -> list[str]:
-    """DB에서 종목 관련 과거 뉴스 헤드라인 조회"""
-    if news_store is None:
-        return []
-
-    try:
-        records = news_store.search_by_symbol(symbol, days=days, limit=20)
-        if not records:
-            # 심볼 매칭이 없으면 키워드로 검색
-            records = news_store.search_by_keyword(symbol, days=days, limit=20)
-        return [r.title_original for r in records]
-    except Exception as e:
-        logger.debug("Historical news lookup failed for %s: %s", symbol, e)
-        return []
-
-
-def run_stock_pipeline(
-    config: dict,
-    symbols: list[str],
-    headlines: list[str],
-    news_store=None,
-    stock_store=None,
-) -> list:
-    """주식 분석 + 추천 파이프라인 (과거 뉴스 데이터 활용)"""
-    price_provider = YFinancePriceProvider()
-    fundamental_provider = YFinanceFundamentalProvider()
-    recommender = Recommender(config)
-
-    sentiment_cfg = config.get("sentiment", {})
-    sentiment_analyzer = None
-    if sentiment_cfg.get("enabled"):
-        sentiment_analyzer = SentimentAnalyzer(model=sentiment_cfg.get("model", "gpt-4o-mini"))
-
-    signals = []
-    for symbol in symbols:
-        try:
-            quote = price_provider.get_current_price(symbol)
-            hist = price_provider.get_historical(symbol, period="6mo")
-            indicators = calculate_indicators(hist, symbol, config)
-
-            fundamentals = None
-            try:
-                fundamentals = fundamental_provider.get_fundamentals(symbol)
-            except Exception as e:
-                logger.warning("Fundamentals failed for %s: %s", symbol, e)
-
-            # 감성 분석: 현재 헤드라인 + 과거 뉴스 결합
-            sentiment_score = 0.0
-            if sentiment_analyzer:
-                # 현재 수집된 헤드라인
-                current_headlines = headlines[:10] if headlines else []
-
-                # DB에서 종목별 과거 뉴스 조회
-                historical = _get_historical_headlines(news_store, symbol, days=7)
-
-                # 현재 + 과거 결합 (현재 뉴스 우선)
-                combined = current_headlines + historical
-                if combined:
-                    sentiment_score = sentiment_analyzer.analyze(combined[:20])
-
-                    # 감성 점수를 DB에 역으로 저장 (최근 뉴스에 대해)
-                    if news_store and historical:
-                        for record in news_store.search_by_symbol(symbol, days=1, limit=5):
-                            if record.sentiment_score is None and record.id:
-                                news_store.update_sentiment(record.id, sentiment_score)
-
-            signal = recommender.recommend(quote, indicators, fundamentals, sentiment_score)
-            signals.append(signal)
-            logger.info("%s: %s (confidence=%.0f%%)", symbol, signal.signal_type.value, signal.confidence * 100)
-
-            # 스냅샷 저장 (추가 API 호출 없이 기존 데이터 재활용)
-            if stock_store is not None:
-                try:
-                    stock_store.save_snapshot(
-                        symbol=symbol,
-                        date=quote.timestamp,
-                        quote=quote,
-                        indicators=indicators,
-                        fundamentals=fundamentals,
-                    )
-                except Exception as e:
-                    logger.warning("Snapshot save failed for %s: %s", symbol, e)
-        except Exception as e:
-            logger.error("Analysis failed for %s: %s", symbol, e)
-
-    return signals
-
-
-def run_news_evaluation(
-    config: dict,
-    symbol_news_map: dict[str, list[NewsAlertItem]],
-    dup_checker: DuplicateChecker,
-) -> list:
-    """뉴스 트리거 기반 종목 평가 → Slack 알림 발송."""
-    evaluator = NewsEvaluator(config)
-    if not evaluator.enabled or not symbol_news_map:
-        return []
-
-    price_provider = YFinancePriceProvider()
-    fundamental_provider = YFinanceFundamentalProvider()
-    alerts = []
-
-    for symbol, news_items in symbol_news_map.items():
-        try:
-            quote = price_provider.get_current_price(symbol)
-            hist = price_provider.get_historical(symbol, period="6mo")
-            indicators = calculate_indicators(hist, symbol, config)
-
-            fundamentals = None
-            try:
-                fundamentals = fundamental_provider.get_fundamentals(symbol)
-            except Exception as e:
-                logger.warning("Fundamentals failed for %s: %s", symbol, e)
-
-            alert = evaluator.evaluate(symbol, quote.price, news_items, indicators, fundamentals)
-            if alert is None:
-                continue
-
-            # 중복 알림 방지
-            alert_key = f"news_{alert.valuation}"
-            if dup_checker.check_signal_duplicate(symbol, alert_key):
-                logger.debug("Duplicate news alert skipped: %s %s", symbol, alert_key)
-                continue
-
-            alerts.append(alert)
-
-            try:
-                slack = SlackSender()
-                msg = format_news_alert_message(alert)
-                slack.send_webhook_message(msg)
-                dup_checker.mark_signal_sent(symbol, alert_key)
-                logger.info("News alert sent: %s (%s)", symbol, alert.valuation)
-            except Exception as e:
-                logger.error("News alert Slack send failed: %s", e)
-
-        except Exception as e:
-            logger.error("News evaluation failed for %s: %s", symbol, e)
-
-    return alerts
-
-
-def discover_new_stocks(config: dict, watchlist: list[str] | None = None) -> list[str]:
-    """종목 자동 탐색 — 새로운 종목을 발견하여 심볼 리스트 반환"""
-    if not is_discovery_enabled(config):
-        return []
-
-    discovery_cfg = get_discovery_config(config)
-    screener = StockScreener(discovery_cfg)
-
-    try:
-        discovered = screener.discover_stocks(extra_symbols=watchlist)
-        logger.info("Discovered %d new stock candidates", len(discovered))
-
-        try:
-            slack = SlackSender()
-            msg = format_discovery_message(discovered)
-            if msg:
-                slack.send_webhook_message(msg)
-        except Exception:
-            pass
-
-        return [d.symbol for d in discovered]
-    except Exception as e:
-        logger.error("Stock discovery failed: %s", e)
-        return []
-
-
-def backfill_categories(news_store, delay: float = 1.0) -> int:
-    """기존 뉴스에 카테고리를 소급 적용합니다."""
-    uncategorized = news_store.get_uncategorized_news()
-    if not uncategorized:
-        logger.info("No uncategorized news found")
-        return 0
-
-    logger.info("Backfilling categories for %d news items", len(uncategorized))
-    translator = GPTTranslator()
-    count = 0
-    for record in uncategorized:
-        try:
-            _, categories = translator.translate_and_categorize(record.title_original)
-            news_store.update_categories(record.id, categories)
-            count += 1
-            logger.info(
-                "Backfill (%d/%d) id=%d: [%s] %s",
-                count, len(uncategorized), record.id,
-                ", ".join(categories), record.title_original[:60],
-            )
-            if count < len(uncategorized):
-                sleep(delay)
-        except Exception as e:
-            logger.error("Backfill failed for id=%d: %s", record.id, e)
-
-    logger.info("Backfill complete: %d/%d categorized", count, len(uncategorized))
-    return count
-
-
-def run_sector_trend_pipeline(config: dict, news_store) -> bool:
-    """섹터 트렌드 분석 → 저평가 종목 발굴 → Slack 리포트 전송.
-
-    Returns:
-        True if report was sent successfully, False otherwise.
-    """
-    from engine.sector_trend import (
-        SectorTrendReport,
-        aggregate_category_sentiment,
-        generate_ai_narrative,
-        identify_promising_sectors,
-        screen_undervalued_in_sectors,
-    )
-    from sender.sector_report_formatter import format_sector_trend_report
-
-    st_cfg = get_sector_trend_config(config)
-    if not st_cfg.get("enabled", False):
-        logger.info("Sector trend analysis disabled")
-        return False
-
-    if news_store is None:
-        logger.warning("Sector trend requires database — skipping")
-        return False
-
-    days = st_cfg.get("analysis_period_days", 7)
-    min_sentiment = st_cfg.get("min_sentiment", 0.1)
-    min_news_count = st_cfg.get("min_news_count", 3)
-    llm_model = st_cfg.get("llm_model", "gpt-4o-mini")
-
-    logger.info("=== Sector Trend Analysis Start (%d days) ===", days)
-
-    # 1. 카테고리별 감성 집계
-    trends = aggregate_category_sentiment(news_store, days=days)
-    if not trends:
-        logger.info("No category sentiment data available")
-        return False
-    logger.info("카테고리 %d개 감성 집계 완료", len(trends))
-
-    # 2. 상승 전망 섹터 식별
-    promising = identify_promising_sectors(trends, min_sentiment, min_news_count)
-    logger.info("상승 전망 섹터 %d개 식별", len(promising))
-
-    # 3. 섹터별 저평가 종목 스크리닝
-    sector_candidates: dict[str, list] = {}
-    for trend, mapping in promising:
-        sectors = mapping.get("sectors", [])
-        industries = mapping.get("industries")
-        candidates = screen_undervalued_in_sectors(sectors, industries, st_cfg)
-        if candidates:
-            sector_candidates[trend.category] = candidates
-            logger.info(
-                "%s 섹터: %d개 저평가 종목 발굴",
-                trend.category, len(candidates),
-            )
-
-    # 4. AI 내러티브 생성
-    narrative = generate_ai_narrative(trends, sector_candidates, model=llm_model)
-
-    # 5. 리포트 생성 & Slack 전송
-    report = SectorTrendReport(
-        analysis_period_days=days,
-        trending_categories=[t for t, _ in promising] if promising else trends[:5],
-        sector_candidates=sector_candidates,
-        ai_narrative=narrative,
-    )
-
-    msg = format_sector_trend_report(report)
-    try:
-        slack = SlackSender()
-        slack.send_webhook_message(msg)
-        logger.info("=== Sector Trend Report sent to Slack ===")
-        return True
-    except Exception as e:
-        logger.error("Sector trend Slack send failed: %s", e)
-        return False
-
-
-def _check_sector_trend_schedule(config: dict, last_run_hours: dict[int, str]) -> bool:
-    """KST 기준으로 스케줄된 시간인지 확인. 중복 실행 방지."""
-    from datetime import timezone, timedelta
-
-    st_cfg = get_sector_trend_config(config)
-    if not st_cfg.get("enabled", False):
-        return False
-
-    schedule_hours = st_cfg.get("schedule_hours_kst", [10, 15])
-    kst = timezone(timedelta(hours=9))
-    now_kst = datetime.now(kst)
-    current_hour = now_kst.hour
-    today_str = now_kst.strftime("%Y-%m-%d")
-
-    if current_hour in schedule_hours:
-        run_key = f"{today_str}_{current_hour}"
-        if last_run_hours.get(current_hour) != run_key:
-            last_run_hours[current_hour] = run_key
-            return True
-
-    return False
 
 
 def main():
@@ -701,53 +41,47 @@ def main():
     poll_interval = config.get("poll_interval_seconds", 300)
     rate_limiter = RateLimiter(state_file="./data/rate_limiter_state.json")
 
-    # DB 초기화
-    news_store = _init_news_store(config)
-    stock_store = _init_stock_store(config)
+    news_store = init_news_store(config)
+    stock_store = init_stock_store(config)
 
-    # 월드 컨텍스트 초기화 (하루 1회 갱신, 인메모리 캐시)
+    # 월드 컨텍스트 초기화
     world_context_provider = None
     world_ctx_cfg = config.get("world_context", {})
     if world_ctx_cfg.get("enabled"):
-        from engine.world_context import WorldContextProvider
+        from news.world_context import WorldContextProvider
         world_context_provider = WorldContextProvider(
             model=world_ctx_cfg.get("model", "gpt-4o-mini"),
             cache_hours=world_ctx_cfg.get("cache_hours", 24),
         )
 
-    # 종목 탐색은 첫 실행 시 한 번만
+    # 종목 탐색 (첫 실행 시 한 번)
     watchlist = get_watchlist(config)
     discovered_symbols = discover_new_stocks(config, watchlist)
     all_symbols = list(dict.fromkeys(watchlist + discovered_symbols))
     logger.info("Tracking %d symbols: %s", len(all_symbols), all_symbols)
 
-    # 섹터 트렌드 스케줄 추적
-    sector_trend_last_runs: dict[int, str] = {}
-
     while True:
         try:
-            # Docker 재시작 포함: 마지막 RSS 호출 시각으로부터 poll_interval 경과 대기
             rate_limiter.wait_if_needed("news_pipeline", poll_interval)
 
-            # 1. 뉴스 파이프라인 (큐레이션 + 감성점수 + DB 저장)
+            # 1. 뉴스 파이프라인
             headlines, symbol_news_map = run_news_pipeline(
                 config, dup_checker, news_store, all_symbols, world_context_provider
             )
 
-            # 2. 뉴스 트리거 기반 즉시 분석 & 알림
+            # 2. 뉴스 트리거 알림
             if symbol_news_map:
                 run_news_evaluation(config, symbol_news_map, dup_checker)
 
-            # 3. 주식 분석 파이프라인 (과거 뉴스 DB 활용)
+            # 3. 주식 분석
             signals = run_stock_pipeline(config, all_symbols, headlines, news_store, stock_store)
 
-            # 4. 시그널 Slack 전송 (HOLD 제외, 중복 제외)
+            # 4. 시그널 Slack 전송
             for signal in signals:
                 if signal.signal_type == SignalType.HOLD:
                     continue
                 if dup_checker.check_signal_duplicate(signal.symbol, signal.signal_type.value):
                     continue
-
                 try:
                     slack = SlackSender()
                     msg = format_signal_message(signal)
@@ -757,18 +91,10 @@ def main():
                 except Exception as e:
                     logger.error("Slack send failed: %s", e)
 
-            # 5. 섹터 트렌드 분석 (스케줄 체크)
-            if _check_sector_trend_schedule(config, sector_trend_last_runs):
-                try:
-                    run_sector_trend_pipeline(config, news_store)
-                except Exception as e:
-                    logger.error("Sector trend pipeline error: %s", e)
-
-            # 6. 페이퍼 트레이딩 (활성화 시)
+            # 5. 페이퍼 트레이딩
             if config.get("paper_trading", {}).get("enabled"):
                 try:
-                    from portfolio.paper_trader import PaperTrader
-
+                    from trading.paper_trader import PaperTrader
                     trader = PaperTrader(config["paper_trading"])
                     for signal in signals:
                         if signal.signal_type != SignalType.HOLD:
@@ -782,23 +108,10 @@ def main():
 
 
 if __name__ == "__main__":
-    import sys
-
-    if "--sector-trend" in sys.argv:
+    if "--backfill-categories" in sys.argv:
         load_dotenv()
         config = load_config()
-        # 읽기 전용으로 열어서 다른 프로세스 lock 충돌 방지
-        news_store = _init_news_store(config, read_only=True)
-        if news_store is None:
-            logger.error("Database not enabled in config")
-            sys.exit(1)
-        success = run_sector_trend_pipeline(config, news_store)
-        news_store.close()
-        sys.exit(0 if success else 1)
-    elif "--backfill-categories" in sys.argv:
-        load_dotenv()
-        config = load_config()
-        news_store = _init_news_store(config)
+        news_store = init_news_store(config)
         if news_store is None:
             logger.error("Database not enabled in config")
             sys.exit(1)
