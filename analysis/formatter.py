@@ -1,4 +1,4 @@
-from shared.models import Signal, SignalType
+from shared.models import MacroData, Signal, SignalType
 
 
 SIGNAL_EMOJI = {
@@ -101,10 +101,55 @@ def format_signal_message(signal: Signal) -> str:
         parts = []
         if f.per is not None:
             parts.append(f"PER={f.per:.1f}")
+        if f.forward_pe is not None:
+            parts.append(f"Fwd PE={f.forward_pe:.1f}")
         if f.pbr is not None:
             parts.append(f"PBR={f.pbr:.1f}")
+        if f.peg_ratio is not None:
+            parts.append(f"PEG={f.peg_ratio:.2f}")
         if parts:
             lines.append("기본 지표: " + " | ".join(parts))
+
+        val_parts = []
+        if f.ev_to_ebitda is not None:
+            val_parts.append(f"EV/EBITDA={f.ev_to_ebitda:.1f}")
+        if f.ev_to_revenue is not None:
+            val_parts.append(f"EV/Sales={f.ev_to_revenue:.1f}")
+        if f.roe is not None:
+            val_parts.append(f"ROE={f.roe:.1%}")
+        if f.roic is not None:
+            val_parts.append(f"ROIC={f.roic:.1%}")
+        if val_parts:
+            lines.append("밸류에이션: " + " | ".join(val_parts))
+
+        margin_parts = []
+        if f.operating_margin is not None:
+            margin_parts.append(f"영업={f.operating_margin:.1%}")
+        if f.net_margin is not None:
+            margin_parts.append(f"순이익={f.net_margin:.1%}")
+        if f.fcf_margin is not None:
+            margin_parts.append(f"FCF={f.fcf_margin:.1%}")
+        if margin_parts:
+            lines.append("마진: " + " | ".join(margin_parts))
+
+        if f.target_mean_price is not None:
+            upside = ((f.target_mean_price / signal.price) - 1) * 100 if signal.price > 0 else 0
+            lines.append(f"애널리스트 목표가: ${f.target_mean_price:.0f} ({upside:+.1f}%) | 추천: {f.recommendation or 'N/A'}")
+
+        if f.short_pct_of_float is not None:
+            lines.append(f"공매도 비율: {f.short_pct_of_float:.1%}")
+
+    if signal.indicators:
+        ind = signal.indicators
+        ext_parts = []
+        if ind.golden_cross:
+            ext_parts.append(":star: 골든크로스 발생!")
+        if ind.death_cross:
+            ext_parts.append(":skull: 데스크로스 발생!")
+        if ind.support is not None and ind.resistance is not None:
+            ext_parts.append(f"지지=${ind.support:.2f} | 저항=${ind.resistance:.2f}")
+        if ext_parts:
+            lines.append("기술 확장: " + " | ".join(ext_parts))
 
     if signal.sentiment_score:
         ctx = _sentiment_context(signal.sentiment_score)
@@ -114,6 +159,46 @@ def format_signal_message(signal: Signal) -> str:
     for r in signal.reasons:
         lines.append(f"  • {_translate_reason(r)}")
 
+    return "\n".join(lines)
+
+
+def _format_pct(val: float | None) -> str:
+    if val is None:
+        return "N/A"
+    return f"{val:.1%}"
+
+
+def _format_num(val: float | None, fmt: str = ",.0f") -> str:
+    if val is None:
+        return "N/A"
+    return f"{val:{fmt}}"
+
+
+def format_macro_message(macro: MacroData) -> str:
+    regime = "강세 (Above SMA200)" if macro.sp500_above_sma200 else "약세 (Below SMA200)"
+    if macro.sp500_above_sma200 is None:
+        regime = "N/A"
+
+    spread_str = f"{macro.yield_spread_10y_2y:+.2f}%" if macro.yield_spread_10y_2y is not None else "N/A"
+    inverted = " :warning: 역전" if macro.yield_spread_10y_2y is not None and macro.yield_spread_10y_2y < 0 else ""
+
+    vix_emoji = ""
+    if macro.vix is not None:
+        if macro.vix > 30:
+            vix_emoji = " :rotating_light: 공포"
+        elif macro.vix > 20:
+            vix_emoji = " :warning: 주의"
+        else:
+            vix_emoji = " :white_check_mark: 안정"
+
+    lines = [
+        ":globe_with_meridians: *매크로 시장 환경*",
+        f"S&P500: {_format_num(macro.sp500, ',.1f')} | 시장 레짐: {regime}",
+        f"VIX: {_format_num(macro.vix, '.1f')}{vix_emoji}",
+        f"10Y 금리: {_format_num(macro.treasury_10y, '.2f')}% | 2Y 금리: {_format_num(macro.treasury_2y, '.2f')}%",
+        f"10Y-2Y 스프레드: {spread_str}{inverted}",
+        f"DXY (달러): {_format_num(macro.dxy, '.2f')} | WTI: ${_format_num(macro.wti_oil, '.2f')} | 금: ${_format_num(macro.gold, '.2f')}",
+    ]
     return "\n".join(lines)
 
 

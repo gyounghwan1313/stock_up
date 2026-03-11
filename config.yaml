@@ -51,6 +51,7 @@ indicators:
   macd_slow: 26                 # MACD 장기 EMA
   macd_signal: 9                # MACD 시그널 라인
   sma_periods: [20, 50, 200]    # 단순 이동평균 기간 (단기/중기/장기)
+  ema_periods: [12, 26, 50]     # 지수이동평균 기간
   bollinger_period: 20          # 볼린저 밴드 기간
   bollinger_std: 2              # 볼린저 밴드 표준편차 배수
 

@@ -21,7 +21,8 @@ from news.pipeline import backfill_categories, run_news_pipeline
 from news.rate_limiter import RateLimiter
 
 from alerts.pipeline import run_news_evaluation
-from analysis.formatter import format_signal_message
+from analysis.formatter import format_signal_message, format_macro_message
+from analysis.macro import MacroDataProvider
 from analysis.pipeline import run_stock_pipeline
 from discovery.pipeline import discover_new_stocks
 
@@ -54,6 +55,9 @@ def main():
             cache_hours=world_ctx_cfg.get("cache_hours", 24),
         )
 
+    # 매크로 데이터 프로바이더 초기화
+    macro_provider = MacroDataProvider()
+
     # 종목 탐색 (첫 실행 시 한 번)
     watchlist = get_watchlist(config)
     discovered_symbols = discover_new_stocks(config, watchlist)
@@ -69,14 +73,27 @@ def main():
                 config, dup_checker, news_store, all_symbols, world_context_provider
             )
 
-            # 2. 뉴스 트리거 알림
+            # 2. 매크로 환경 데이터 수집
+            macro_data = None
+            try:
+                macro_data = macro_provider.get_macro_data()
+                if not dup_checker.check_signal_duplicate("MACRO", "macro_update"):
+                    slack = SlackSender()
+                    macro_msg = format_macro_message(macro_data)
+                    slack.send_webhook_message(macro_msg)
+                    dup_checker.mark_signal_sent("MACRO", "macro_update")
+                    logger.info("Macro data sent to Slack")
+            except Exception as e:
+                logger.warning("Macro data collection failed: %s", e)
+
+            # 3. 뉴스 트리거 알림
             if symbol_news_map:
                 run_news_evaluation(config, symbol_news_map, dup_checker)
 
-            # 3. 주식 분석
+            # 4. 주식 분석
             signals = run_stock_pipeline(config, all_symbols, headlines, news_store, stock_store)
 
-            # 4. 시그널 Slack 전송
+            # 5. 시그널 Slack 전송
             for signal in signals:
                 if signal.signal_type == SignalType.HOLD:
                     continue
@@ -91,7 +108,7 @@ def main():
                 except Exception as e:
                     logger.error("Slack send failed: %s", e)
 
-            # 5. 페이퍼 트레이딩
+            # 6. 페이퍼 트레이딩
             if config.get("paper_trading", {}).get("enabled"):
                 try:
                     from trading.paper_trader import PaperTrader

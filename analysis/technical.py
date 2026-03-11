@@ -1,6 +1,36 @@
+import numpy as np
 import pandas as pd
 
 from shared.models import IndicatorResult
+
+
+def compute_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
+    direction = np.sign(close.diff())
+    direction.iloc[0] = 0
+    return (volume * direction).cumsum()
+
+
+def detect_cross(sma_short: pd.Series, sma_long: pd.Series) -> tuple[bool, bool]:
+    """최근 2일 기준 골든크로스/데스크로스 감지. (golden, death) 반환."""
+    if len(sma_short) < 2 or len(sma_long) < 2:
+        return False, False
+    prev_diff = sma_short.iloc[-2] - sma_long.iloc[-2]
+    curr_diff = sma_short.iloc[-1] - sma_long.iloc[-1]
+    golden = prev_diff <= 0 and curr_diff > 0
+    death = prev_diff >= 0 and curr_diff < 0
+    return golden, death
+
+
+def compute_pivot_points(high: float, low: float, close: float) -> tuple[float, float, float]:
+    """피봇 포인트, 지지선(S1), 저항선(R1) 계산."""
+    pivot = (high + low + close) / 3
+    support = 2 * pivot - high
+    resistance = 2 * pivot - low
+    return pivot, support, resistance
 
 
 def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -58,13 +88,45 @@ def calculate_indicators(
 
     sma_periods = ind_cfg.get("sma_periods", [20, 50, 200])
     sma_values = {}
+    sma_series = {}
     for p in sma_periods:
         s = compute_sma(close, p)
         sma_values[p] = s.iloc[-1] if not s.empty and pd.notna(s.iloc[-1]) else None
+        sma_series[p] = s
 
     bb_period = ind_cfg.get("bollinger_period", 20)
     bb_std = ind_cfg.get("bollinger_std", 2)
     bb_upper, bb_middle, bb_lower = compute_bollinger(close, bb_period, bb_std)
+
+    # EMA
+    ema_periods = ind_cfg.get("ema_periods", [12, 26, 50])
+    ema_values = {}
+    for p in ema_periods:
+        e = compute_ema(close, p)
+        ema_values[p] = float(e.iloc[-1]) if not e.empty and pd.notna(e.iloc[-1]) else None
+
+    # OBV
+    obv_val = None
+    if "Volume" in df.columns:
+        obv_series = compute_obv(close, df["Volume"])
+        obv_val = float(obv_series.iloc[-1]) if not obv_series.empty else None
+
+    # Golden Cross / Death Cross (SMA50 vs SMA200)
+    golden_cross = None
+    death_cross = None
+    if 50 in sma_series and 200 in sma_series:
+        s50 = sma_series[50].dropna()
+        s200 = sma_series[200].dropna()
+        if len(s50) >= 2 and len(s200) >= 2:
+            golden_cross, death_cross = detect_cross(s50, s200)
+
+    # 피봇 포인트 (전일 기준)
+    pivot_val = support_val = resistance_val = None
+    if len(df) >= 2:
+        prev = df.iloc[-2]
+        pivot_val, support_val, resistance_val = compute_pivot_points(
+            float(prev["High"]), float(prev["Low"]), float(prev["Close"])
+        )
 
     return IndicatorResult(
         symbol=symbol,
@@ -76,4 +138,11 @@ def calculate_indicators(
         bollinger_upper=float(bb_upper.iloc[-1]) if pd.notna(bb_upper.iloc[-1]) else None,
         bollinger_middle=float(bb_middle.iloc[-1]) if pd.notna(bb_middle.iloc[-1]) else None,
         bollinger_lower=float(bb_lower.iloc[-1]) if pd.notna(bb_lower.iloc[-1]) else None,
+        ema=ema_values,
+        obv=obv_val,
+        golden_cross=golden_cross,
+        death_cross=death_cross,
+        pivot=pivot_val,
+        support=support_val,
+        resistance=resistance_val,
     )

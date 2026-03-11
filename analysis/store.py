@@ -28,6 +28,16 @@ CREATE TABLE IF NOT EXISTS stock_snapshots (
     bollinger_upper REAL,
     bollinger_middle REAL,
     bollinger_lower REAL,
+    -- 확장 기술적 지표
+    ema_12          REAL,
+    ema_26          REAL,
+    ema_50          REAL,
+    obv             REAL,
+    golden_cross    BOOLEAN,
+    death_cross     BOOLEAN,
+    pivot_point     REAL,
+    support_level   REAL,
+    resistance_level REAL,
     -- 펀더멘탈
     per             REAL,
     pbr             REAL,
@@ -39,11 +49,48 @@ CREATE TABLE IF NOT EXISTS stock_snapshots (
     market_cap      BIGINT,
     sector          VARCHAR,
     industry        VARCHAR,
+    -- 확장 펀더멘탈
+    forward_pe      REAL,
+    peg_ratio       REAL,
+    ev_to_ebitda    REAL,
+    ev_to_revenue   REAL,
+    fcf             REAL,
+    operating_margin REAL,
+    net_margin      REAL,
+    fcf_margin      REAL,
+    roic            REAL,
+    short_pct       REAL,
+    target_mean_price REAL,
+    recommendation  VARCHAR,
     -- 메타
     collected_at    TIMESTAMP NOT NULL,
     UNIQUE(symbol, date)
 );
 """
+
+MIGRATE_COLUMNS_SQL = [
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS ema_12 REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS ema_26 REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS ema_50 REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS obv REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS golden_cross BOOLEAN",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS death_cross BOOLEAN",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS pivot_point REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS support_level REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS resistance_level REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS forward_pe REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS peg_ratio REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS ev_to_ebitda REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS ev_to_revenue REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS fcf REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS operating_margin REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS net_margin REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS fcf_margin REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS roic REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS short_pct REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS target_mean_price REAL",
+    "ALTER TABLE stock_snapshots ADD COLUMN IF NOT EXISTS recommendation VARCHAR",
+]
 
 INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_snapshot_symbol ON stock_snapshots(symbol);
@@ -68,6 +115,12 @@ class StockStore:
     def init_schema(self) -> None:
         self.conn.execute("CREATE SEQUENCE IF NOT EXISTS stock_snapshot_id_seq START 1")
         self.conn.execute(SCHEMA_SQL)
+        # 기존 테이블에 새 컬럼 추가 (마이그레이션)
+        for sql in MIGRATE_COLUMNS_SQL:
+            try:
+                self.conn.execute(sql)
+            except Exception:
+                pass  # 이미 존재하거나 지원되지 않으면 무시
         self.conn.execute(INDEX_SQL)
         logger.info("DuckDB stock_snapshots schema initialized: %s", self.db_path)
 
@@ -99,6 +152,18 @@ class StockStore:
         bollinger_middle = getattr(indicators, "bollinger_middle", None)
         bollinger_lower = getattr(indicators, "bollinger_lower", None)
 
+        # 확장 기술적 지표
+        ema = getattr(indicators, "ema", {}) or {}
+        ema_12 = ema.get(12)
+        ema_26 = ema.get(26)
+        ema_50 = ema.get(50)
+        obv = getattr(indicators, "obv", None)
+        golden_cross = getattr(indicators, "golden_cross", None)
+        death_cross = getattr(indicators, "death_cross", None)
+        pivot_point = getattr(indicators, "pivot", None)
+        support_level = getattr(indicators, "support", None)
+        resistance_level = getattr(indicators, "resistance", None)
+
         per = getattr(fundamentals, "per", None)
         pbr = getattr(fundamentals, "pbr", None)
         psr = getattr(fundamentals, "psr", None)
@@ -112,6 +177,20 @@ class StockStore:
         sector = getattr(fundamentals, "sector", None)
         industry = getattr(fundamentals, "industry", None)
 
+        # 확장 펀더멘털
+        forward_pe = getattr(fundamentals, "forward_pe", None)
+        peg_ratio = getattr(fundamentals, "peg_ratio", None)
+        ev_to_ebitda = getattr(fundamentals, "ev_to_ebitda", None)
+        ev_to_revenue = getattr(fundamentals, "ev_to_revenue", None)
+        fcf = getattr(fundamentals, "fcf", None)
+        operating_margin = getattr(fundamentals, "operating_margin", None)
+        net_margin = getattr(fundamentals, "net_margin", None)
+        fcf_margin = getattr(fundamentals, "fcf_margin", None)
+        roic = getattr(fundamentals, "roic", None)
+        short_pct = getattr(fundamentals, "short_pct_of_float", None)
+        target_mean_price = getattr(fundamentals, "target_mean_price", None)
+        recommendation = getattr(fundamentals, "recommendation", None)
+
         self.conn.execute(
             """
             INSERT INTO stock_snapshots (
@@ -119,15 +198,27 @@ class StockStore:
                 rsi, macd, macd_signal, macd_histogram,
                 sma_20, sma_50, sma_200,
                 bollinger_upper, bollinger_middle, bollinger_lower,
+                ema_12, ema_26, ema_50, obv, golden_cross, death_cross,
+                pivot_point, support_level, resistance_level,
                 per, pbr, psr, roe, eps, dividend_yield, debt_to_equity,
-                market_cap, sector, industry, collected_at
+                market_cap, sector, industry,
+                forward_pe, peg_ratio, ev_to_ebitda, ev_to_revenue,
+                fcf, operating_margin, net_margin, fcf_margin, roic,
+                short_pct, target_mean_price, recommendation,
+                collected_at
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?,
                 ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?
+                ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?,
+                ?
             )
             ON CONFLICT (symbol, date) DO UPDATE SET
                 open = EXCLUDED.open,
@@ -145,6 +236,15 @@ class StockStore:
                 bollinger_upper = EXCLUDED.bollinger_upper,
                 bollinger_middle = EXCLUDED.bollinger_middle,
                 bollinger_lower = EXCLUDED.bollinger_lower,
+                ema_12 = EXCLUDED.ema_12,
+                ema_26 = EXCLUDED.ema_26,
+                ema_50 = EXCLUDED.ema_50,
+                obv = EXCLUDED.obv,
+                golden_cross = EXCLUDED.golden_cross,
+                death_cross = EXCLUDED.death_cross,
+                pivot_point = EXCLUDED.pivot_point,
+                support_level = EXCLUDED.support_level,
+                resistance_level = EXCLUDED.resistance_level,
                 per = EXCLUDED.per,
                 pbr = EXCLUDED.pbr,
                 psr = EXCLUDED.psr,
@@ -155,6 +255,18 @@ class StockStore:
                 market_cap = EXCLUDED.market_cap,
                 sector = EXCLUDED.sector,
                 industry = EXCLUDED.industry,
+                forward_pe = EXCLUDED.forward_pe,
+                peg_ratio = EXCLUDED.peg_ratio,
+                ev_to_ebitda = EXCLUDED.ev_to_ebitda,
+                ev_to_revenue = EXCLUDED.ev_to_revenue,
+                fcf = EXCLUDED.fcf,
+                operating_margin = EXCLUDED.operating_margin,
+                net_margin = EXCLUDED.net_margin,
+                fcf_margin = EXCLUDED.fcf_margin,
+                roic = EXCLUDED.roic,
+                short_pct = EXCLUDED.short_pct,
+                target_mean_price = EXCLUDED.target_mean_price,
+                recommendation = EXCLUDED.recommendation,
                 collected_at = EXCLUDED.collected_at
             """,
             [
@@ -162,8 +274,14 @@ class StockStore:
                 rsi, macd, macd_signal, macd_histogram,
                 sma_20, sma_50, sma_200,
                 bollinger_upper, bollinger_middle, bollinger_lower,
+                ema_12, ema_26, ema_50, obv, golden_cross, death_cross,
+                pivot_point, support_level, resistance_level,
                 per, pbr, psr, roe, eps, dividend_yield, debt_to_equity,
-                market_cap, sector, industry, datetime.now(),
+                market_cap, sector, industry,
+                forward_pe, peg_ratio, ev_to_ebitda, ev_to_revenue,
+                fcf, operating_margin, net_margin, fcf_margin, roic,
+                short_pct, target_mean_price, recommendation,
+                datetime.now(),
             ],
         )
 
